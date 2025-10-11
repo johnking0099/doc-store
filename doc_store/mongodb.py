@@ -1,3 +1,7 @@
+import getpass
+import os
+import socket
+
 import pymongo
 
 from .config import config
@@ -9,11 +13,39 @@ FLUSH_COUNT = 200
 MAX_RETRIES = 10
 
 
-def get_collection(name: str):
+def get_username() -> str:
+    """Get the current user name."""
+    username = getpass.getuser()
+    if not username:
+        username = os.getlogin()
+    if not username:
+        username = "unknown"
+    return username
+
+
+def get_mongo_client():
     db_uri = config.db.uri
-    client = pymongo.MongoClient(db_uri)
-    db_instance = client.get_database()
-    return db_instance.get_collection(name)
+    username = get_username()
+    hostname = socket.gethostname()
+    pid = os.getpid()
+    client = pymongo.MongoClient(
+        db_uri,
+        appname=f"DocStore({username}@{hostname}:{pid})",
+        minPoolSize=1,
+        maxPoolSize=10,
+        maxIdleTimeMS=10000,
+    )
+    return client
+
+
+def get_mongo_db():
+    client = get_mongo_client()
+    return client.get_database()
+
+
+def get_collection(name: str):
+    db = get_mongo_db()
+    return db.get_collection(name)
 
 
 class MongoBulkWriter:

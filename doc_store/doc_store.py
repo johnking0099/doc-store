@@ -18,9 +18,10 @@ import pymongo.errors
 from bson.objectid import ObjectId
 from PIL import Image, ImageDraw
 from pymongo import ReturnDocument
+from pymongo.database import Database
 
 from .kafka import KafkaWriter
-from .mongodb import get_collection
+from .mongodb import get_mongo_db
 from .pdf_doc import PDFDocument
 from .s3 import head_s3_object, put_s3_object, read_s3_object_bytes
 from .structs import ANGLE_OPTIONS, BLOCK_TYPES, CONTENT_FORMATS, ContentBlock
@@ -82,7 +83,7 @@ def _secs_to_readable(secs: int) -> str:
     return f"{hours:02}:{minutes:02}:{secs:02}"
 
 
-def _get_docs_coll():
+def _get_docs_coll(db: Database):
     # {
     #   /* ID */
     #   "id": "doc-caa42891-d13b-4dbf-ab7c-d2d23f76d770", // the unique doc_id
@@ -117,7 +118,7 @@ def _get_docs_coll():
     #   "create_time": 1749031069945,
     #   "update_time": 1749031069945,
     # }
-    coll_docs = get_collection("docs")
+    coll_docs = db.get_collection("docs")
     coll_docs.create_index([("id", 1)], unique=True)
     coll_docs.create_index([("pdf_path", 1)], unique=True)
     coll_docs.create_index([("pdf_hash", 1)], unique=True)
@@ -126,7 +127,7 @@ def _get_docs_coll():
     return coll_docs
 
 
-def _get_pages_coll():
+def _get_pages_coll(db: Database):
     # {
     #   /* ID */
     #   "id": "page-aac0d7e4-d22d-4b08-a8e8-1be28f79bc06", // the unique page_id
@@ -155,7 +156,7 @@ def _get_pages_coll():
     #   "create_time": 1749031069945,
     #   "update_time": 1749031069945,
     # }
-    coll_pages = get_collection("pages")
+    coll_pages = db.get_collection("pages")
     coll_pages.create_index([("id", 1)], unique=True)
     coll_pages.create_index([("image_path", 1)], unique=True)
     # coll_pages.create_index([("image_hash", 1)], unique=True)
@@ -171,7 +172,7 @@ def _get_pages_coll():
     return coll_pages
 
 
-def _get_layouts_coll():
+def _get_layouts_coll(db: Database):
     # {
     #   /* ID */
     #   "id": "layout-2b239dce-9c61-4a5d-9e73-1fb6f145eafe", // the unique layout_id
@@ -214,7 +215,7 @@ def _get_layouts_coll():
     #   "create_time": 1749031069945,
     #   "update_time": 1749031069945,
     # }
-    coll_layouts = get_collection("layouts")
+    coll_layouts = db.get_collection("layouts")
     coll_layouts.create_index([("id", 1)], unique=True)
     coll_layouts.create_index([("page_id", 1), ("provider", 1)], unique=True)
     coll_layouts.create_index([("provider", 1)])
@@ -223,7 +224,7 @@ def _get_layouts_coll():
     return coll_layouts
 
 
-def _get_blocks_coll():
+def _get_blocks_coll(db: Database):
     # {
     #   /* ID */
     #   "id": "block-145f4ce9-8b22-4c8b-a448-e6546f8ebe5d", // the unique block_id
@@ -248,7 +249,7 @@ def _get_blocks_coll():
     #   "create_time": 1749031069945,
     #   "update_time": 1749031069945,
     # }
-    coll_blocks = get_collection("blocks")
+    coll_blocks = db.get_collection("blocks")
     coll_blocks.create_index([("id", 1)], unique=True)
     # TODO: uncomment when index built.
     # coll_blocks.create_index([("page_id", 1), ("type", 1), ("bbox", 1), ("angle", 1)], unique=True)
@@ -257,7 +258,7 @@ def _get_blocks_coll():
     return coll_blocks
 
 
-def _get_contents_coll():
+def _get_contents_coll(db: Database):
     # {
     #   /* ID */
     #   "id": "content-01a0c73b-c25c-4d5b-a535-5b21c55c5fd3", // the unique content_id
@@ -282,7 +283,7 @@ def _get_contents_coll():
     #   "create_time": 1749031069945,
     #   "update_time": 1749031069945,
     # }
-    coll_contents = get_collection("contents")
+    coll_contents = db.get_collection("contents")
     coll_contents.create_index([("id", 1)], unique=True)
     coll_contents.create_index([("block_id", 1), ("version", 1)], unique=True)
     coll_contents.create_index([("version", 1)])
@@ -292,7 +293,7 @@ def _get_contents_coll():
     return coll_contents
 
 
-def _get_values_coll():
+def _get_values_coll(db: Database):
     # {
     #   /* ID */
     #   "id": "value-01a0c73b-c25c-4d5b-a535-5b21c55c5fd3", // the unique value_id
@@ -308,14 +309,14 @@ def _get_values_coll():
     #   "create_time": 1749031069945,
     #   "update_time": 1749031069945,
     # }
-    coll_values = get_collection("values")
+    coll_values = db.get_collection("values")
     coll_values.create_index([("id", 1)], unique=True)
     coll_values.create_index([("target", 1), ("key", 1)], unique=True)
     coll_values.create_index([("key", 1)])
     return coll_values
 
 
-def _get_tasks_coll():
+def _get_tasks_coll(db: Database):
     # {
     #   /* ID */
     #   "id": "task-dc99b06d-aeb2-4159-a4b9-a2bcf3c26b9b", // the unique task_id
@@ -336,7 +337,7 @@ def _get_tasks_coll():
     #   "grab_user": "worker-1",  # the worker who grabbed the task
     #   "grab_time": 1749031069945,  # when the task was grabbed by a worker
     # }
-    coll_tasks = get_collection("tasks")
+    coll_tasks = db.get_collection("tasks")
     coll_tasks.create_index([("id", 1)], unique=True)
     coll_tasks.create_index([("target", 1)])
     coll_tasks.create_index([("status", 1)])
@@ -345,31 +346,31 @@ def _get_tasks_coll():
     return coll_tasks
 
 
-def _get_known_users_coll():
-    coll_known_users = get_collection("known_users")
+def _get_known_users_coll(db: Database):
+    coll_known_users = db.get_collection("known_users")
     coll_known_users.create_index([("name", 1)], unique=True)
     return coll_known_users
 
 
-def _get_known_names_coll():
-    coll_known_names = get_collection("known_names")
+def _get_known_names_coll(db: Database):
+    coll_known_names = db.get_collection("known_names")
     coll_known_names.create_index([("name", 1)], unique=True)
     return coll_known_names
 
 
-def _get_task_shortcuts_coll():
-    coll_task_shortcuts = get_collection("task_shortcuts")
+def _get_task_shortcuts_coll(db: Database):
+    coll_task_shortcuts = db.get_collection("task_shortcuts")
     coll_task_shortcuts.create_index([("name", 1)], unique=True)
     return coll_task_shortcuts
 
 
-def _get_locks_coll():
+def _get_locks_coll(db: Database):
     # collection for distributed locks
     # {
     #   "key": "page-blocks:145f4ce9-8b22-4c8b-a448-e6546f8ebe5d",
     #   "version": 1,  # incremented on each write
     # }
-    coll_locks = get_collection("locks")
+    coll_locks = db.get_collection("locks")
     coll_locks.create_index([("key", 1)], unique=True)
     return coll_locks
 
@@ -383,8 +384,8 @@ class ShouldRetryError(Exception):
 
 
 class VersionalLocker:
-    def __init__(self) -> None:
-        self.coll_locks = _get_locks_coll()
+    def __init__(self, db: Database) -> None:
+        self.coll_locks = _get_locks_coll(db)
 
     def read_ahead(self, key: str) -> int:
         """Read the lock version for a given key."""
@@ -1208,17 +1209,18 @@ class DocEvent(dict):
 
 class DocStore:
     def __init__(self, measure_time=False, disable_events=False):
-        self.coll_docs = _get_docs_coll()
-        self.coll_pages = _get_pages_coll()
-        self.coll_layouts = _get_layouts_coll()
-        self.coll_blocks = _get_blocks_coll()
-        self.coll_contents = _get_contents_coll()
-        self.coll_values = _get_values_coll()
-        self.coll_tasks = _get_tasks_coll()
-        self.coll_known_users = _get_known_users_coll()
-        self.coll_known_names = _get_known_names_coll()
-        self.coll_task_shortcuts = _get_task_shortcuts_coll()
-        self.locker = VersionalLocker()
+        db = get_mongo_db()
+        self.coll_docs = _get_docs_coll(db)
+        self.coll_pages = _get_pages_coll(db)
+        self.coll_layouts = _get_layouts_coll(db)
+        self.coll_blocks = _get_blocks_coll(db)
+        self.coll_contents = _get_contents_coll(db)
+        self.coll_values = _get_values_coll(db)
+        self.coll_tasks = _get_tasks_coll(db)
+        self.coll_known_users = _get_known_users_coll(db)
+        self.coll_known_names = _get_known_names_coll(db)
+        self.coll_task_shortcuts = _get_task_shortcuts_coll(db)
+        self.locker = VersionalLocker(db)
         self.measure_time = measure_time
         self.times = {}
 
