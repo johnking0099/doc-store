@@ -38,6 +38,7 @@ Issues = "https://github.com/johnking0099/doc-store/issues"
 server = [
   "fastapi",
   "uvicorn[standard]",
+  "gunicorn",
 ]
 
 [tool.black]

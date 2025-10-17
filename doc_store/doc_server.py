@@ -2,7 +2,7 @@ import json
 import logging
 from typing import Any, Iterable, Literal
 
-from fastapi import FastAPI, Query, Request, status
+from fastapi import APIRouter, FastAPI, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -90,14 +90,17 @@ class DocServer(DocStoreInterface):
                 routes.append((route_info["index"], route_info, attr))
 
         # Register routes
+        api_router = APIRouter(prefix="/api/v1")
         for _, route_info, endpoint in sorted(routes):
-            self.app.add_api_route(
+            api_router.add_api_route(
                 path=route_info["path"],
                 endpoint=endpoint,
                 methods=[route_info["method"]],
                 response_model=None,
                 tags=route_info["tags"],
             )
+
+        self.app.include_router(api_router)
 
     async def exception_middleware(self, request: Request, call_next):
         try:

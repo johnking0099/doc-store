@@ -36,6 +36,7 @@ class DocClient(DocStoreInterface):
     def __init__(
         self,
         server_url: str | None = None,
+        prefix: str = "/api/v1",
         timeout: int = 300,
         connect_timeout: int = 30,
     ):
@@ -54,6 +55,7 @@ class DocClient(DocStoreInterface):
         if not server_url:
             raise ValueError("server_url must be provided either in argument or config.")
         self.server_url = server_url.rstrip("/")
+        self.prefix = prefix.rstrip("/")
 
         self.client = httpx.Client(
             headers={
@@ -87,7 +89,7 @@ class DocClient(DocStoreInterface):
         params: dict | None = None,
     ) -> httpx.Response:
         """Make HTTP request to the server."""
-        url = f"{self.server_url}{path}"
+        url = f"{self.server_url}{self.prefix}{path}"
 
         response = self.client.request(
             method=method,
@@ -143,7 +145,7 @@ class DocClient(DocStoreInterface):
 
     def _stream(self, path: str, json_data: dict | list | None = None, params: dict | None = None) -> Iterable[dict]:
         """Make POST request and stream JSON lines response."""
-        url = f"{self.server_url}{path}"
+        url = f"{self.server_url}{self.prefix}{path}"
 
         with self.client.stream("POST", url, json=json_data, params=params) as response:
             response.raise_for_status()
