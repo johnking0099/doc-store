@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import Any, Iterable, Literal
 
 from fastapi import FastAPI, Query, Request, status
@@ -30,6 +31,7 @@ from .interface import (
     ValueInput,
 )
 
+INJECT: Any = None
 _global_index = 0
 
 
@@ -64,7 +66,12 @@ class DocServer(DocStoreInterface):
     def __init__(self, store: DocStore) -> None:
         super().__init__()
         self.store = store
+        self.store_cache = {}
         self.app = FastAPI(title="DocStore API")
+        self.logger = logging.getLogger(__name__)
+
+        # self.app.add_exception_handler(Exception, self.exception_handler)
+        self.app.middleware("http")(self.exception_middleware)
 
         self.app.add_middleware(
             CORSMiddleware,
@@ -92,7 +99,12 @@ class DocServer(DocStoreInterface):
                 tags=route_info["tags"],
             )
 
-        self.app.add_exception_handler(Exception, self.exception_handler)
+    async def exception_middleware(self, request: Request, call_next):
+        try:
+            response = await call_next(request)
+            return response
+        except Exception as e:
+            return self.exception_handler(request, e)
 
     def exception_handler(self, _: Request, e: Exception):
         if isinstance(e, ElementNotFoundError):
@@ -105,66 +117,82 @@ class DocServer(DocStoreInterface):
                 status_code=status.HTTP_409_CONFLICT,
                 content={"error": "ElementExistsError", "message": str(e)},
             )
+        elif isinstance(e, ValueError):
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"error": "ValueError", "message": str(e)},
+            )
+        self.logger.error("Unhandled exception occurred", exc_info=e)
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"error": "InternalServerError", "message": str(e)},
         )
 
+    def get_store(self, req: Request) -> DocStore:
+        username = req.headers.get("X-Username")
+        if not username:
+            username = "tmp"
+        store = self.store_cache.get(username)
+        if not store:
+            store = self.store.impersonate(username)
+            self.store_cache[username] = store
+        return store
+
     @route("GET", "/docs/{doc_id}", tags=["docs"])
-    def get_doc(self, doc_id: str) -> Doc:
-        return self.store.get_doc(doc_id)
+    def get_doc(self, doc_id: str, req: Request = INJECT) -> Doc:
+        return self.get_store(req).get_doc(doc_id)
 
-    @route("GET", "/docs/pdf-path/{pdf_path}", tags=["docs"])
-    def get_doc_by_pdf_path(self, pdf_path: str) -> Doc:
-        return self.store.get_doc_by_pdf_path(pdf_path)
+    @route("GET", "/docs/pdf-path/{pdf_path:path}", tags=["docs"])
+    def get_doc_by_pdf_path(self, pdf_path: str, req: Request = INJECT) -> Doc:
+        return self.get_store(req).get_doc_by_pdf_path(pdf_path)
 
-    @route("GET", "/docs/pdf-hash/{pdf_hash}", tags=["docs"])
-    def get_doc_by_pdf_hash(self, pdf_hash: str) -> Doc:
-        return self.store.get_doc_by_pdf_hash(pdf_hash)
+    @route("GET", "/docs/pdf-hash/{pdf_hash:path}", tags=["docs"])
+    def get_doc_by_pdf_hash(self, pdf_hash: str, req: Request = INJECT) -> Doc:
+        return self.get_store(req).get_doc_by_pdf_hash(pdf_hash)
 
     @route("GET", "/pages/{page_id}", tags=["pages"])
-    def get_page(self, page_id: str) -> Page:
-        return self.store.get_page(page_id)
+    def get_page(self, page_id: str, req: Request = INJECT) -> Page:
+        return self.get_store(req).get_page(page_id)
 
-    @route("GET", "/pages/image-path/{image_path}", tags=["pages"])
-    def get_page_by_image_path(self, image_path: str) -> Page:
-        return self.store.get_page_by_image_path(image_path)
+    @route("GET", "/pages/image-path/{image_path:path}", tags=["pages"])
+    def get_page_by_image_path(self, image_path: str, req: Request = INJECT) -> Page:
+        return self.get_store(req).get_page_by_image_path(image_path)
 
     @route("GET", "/layouts/{layout_id}", tags=["layouts"])
-    def get_layout(self, layout_id: str) -> Layout:
-        return self.store.get_layout(layout_id)
+    def get_layout(self, layout_id: str, req: Request = INJECT) -> Layout:
+        return self.get_store(req).get_layout(layout_id)
 
     @route("GET", "/pages/{page_id}/layouts/{provider}", tags=["layouts"])
-    def get_layout_by_page_id_and_provider(self, page_id: str, provider: str) -> Layout:
-        return self.store.get_layout_by_page_id_and_provider(page_id, provider)
+    def get_layout_by_page_id_and_provider(self, page_id: str, provider: str, req: Request = INJECT) -> Layout:
+        return self.get_store(req).get_layout_by_page_id_and_provider(page_id, provider)
 
     @route("GET", "/blocks/{block_id}", tags=["blocks"])
-    def get_block(self, block_id: str) -> Block:
-        return self.store.get_block(block_id)
+    def get_block(self, block_id: str, req: Request = INJECT) -> Block:
+        return self.get_store(req).get_block(block_id)
 
     @route("GET", "/pages/{page_id}/super-block", tags=["blocks"])
-    def get_super_block(self, page_id: str) -> Block:
-        return self.store.get_super_block(page_id)
+    def get_super_block(self, page_id: str, req: Request = INJECT) -> Block:
+        return self.get_store(req).get_super_block(page_id)
 
     @route("GET", "/contents/{content_id}", tags=["contents"])
-    def get_content(self, content_id: str) -> Content:
-        return self.store.get_content(content_id)
+    def get_content(self, content_id: str, req: Request = INJECT) -> Content:
+        return self.get_store(req).get_content(content_id)
 
     @route("GET", "/blocks/{block_id}/contents/{version}", tags=["contents"])
-    def get_content_by_block_id_and_version(self, block_id: str, version: str) -> Content:
-        return self.store.get_content_by_block_id_and_version(block_id, version)
+    def get_content_by_block_id_and_version(self, block_id: str, version: str, req: Request = INJECT) -> Content:
+        return self.get_store(req).get_content_by_block_id_and_version(block_id, version)
 
     @route("GET", "/values/{value_id}", tags=["values"])
-    def get_value(self, value_id: str) -> Value:
-        return self.store.get_value(value_id)
+    def get_value(self, value_id: str, req: Request = INJECT) -> Value:
+        return self.get_store(req).get_value(value_id)
 
     @route("GET", "/elements/{elem_id}/values/{key}", tags=["values"])
-    def get_value_by_elem_id_and_key(self, elem_id: str, key: str) -> Value:
-        return self.store.get_value_by_elem_id_and_key(elem_id, key)
+    def get_value_by_elem_id_and_key(self, elem_id: str, key: str, req: Request = INJECT) -> Value:
+        return self.get_store(req).get_value_by_elem_id_and_key(elem_id, key)
 
     @route("GET", "/tasks/{task_id}", tags=["tasks"])
-    def get_task(self, task_id: str) -> Task:
-        return self.store.get_task(task_id)
+    def get_task(self, task_id: str, req: Request = INJECT) -> Task:
+        return self.get_store(req).get_task(task_id)
 
     @route("POST", "/distinct/{elem_type}/{field}", tags=["others"])
     def distinct_values(
@@ -172,8 +200,9 @@ class DocServer(DocStoreInterface):
         elem_type: ElemType,
         field: Literal["tags", "provider", "version"],
         query: dict | None = None,
+        req: Request = INJECT,
     ) -> list[str]:
-        return self.store.distinct_values(elem_type, field, query)
+        return self.get_store(req).distinct_values(elem_type, field, query)
 
     @route("POST", "/stream/{elem_type}", tags=["others"])
     def find(
@@ -183,8 +212,9 @@ class DocServer(DocStoreInterface):
         query_from: ElemType | None = None,
         skip: int | None = None,
         limit: int | None = None,
+        req: Request = INJECT,
     ) -> Iterable[Element]:
-        it = self.store.find(elem_type, query, query_from, skip, limit)
+        it = self.get_store(req).find(elem_type, query, query_from, skip, limit)
         return StreamingResponse(iter_response(it), media_type="text/plain; charset=utf8")  # type: ignore
 
     @route("POST", "/list/docs", tags=["docs"])
@@ -193,8 +223,9 @@ class DocServer(DocStoreInterface):
         query: dict | None = None,
         skip: int = Query(default=0, ge=0),
         limit: int = Query(default=10, ge=1, le=1000),
+        req: Request = INJECT,
     ) -> list[Doc]:
-        it = self.store.find_docs(query, skip=skip, limit=limit)
+        it = self.get_store(req).find_docs(query, skip=skip, limit=limit)
         return list(it)
 
     @route("POST", "/list/pages", tags=["pages"])
@@ -204,8 +235,9 @@ class DocServer(DocStoreInterface):
         doc_id: str | None = None,
         skip: int = Query(default=0, ge=0),
         limit: int = Query(default=10, ge=1, le=1000),
+        req: Request = INJECT,
     ) -> list[Page]:
-        it = self.store.find_pages(query, doc_id, skip=skip, limit=limit)
+        it = self.get_store(req).find_pages(query, doc_id, skip=skip, limit=limit)
         return list(it)
 
     @route("POST", "/list/layouts", tags=["layouts"])
@@ -215,8 +247,9 @@ class DocServer(DocStoreInterface):
         page_id: str | None = None,
         skip: int = Query(default=0, ge=0),
         limit: int = Query(default=10, ge=1, le=1000),
+        req: Request = INJECT,
     ) -> list[Layout]:
-        it = self.store.find_layouts(query, page_id, skip=skip, limit=limit)
+        it = self.get_store(req).find_layouts(query, page_id, skip=skip, limit=limit)
         return list(it)
 
     @route("POST", "/list/blocks", tags=["blocks"])
@@ -226,8 +259,9 @@ class DocServer(DocStoreInterface):
         page_id: str | None = None,
         skip: int | None = None,
         limit: int | None = None,
+        req: Request = INJECT,
     ) -> list[Block]:
-        it = self.store.find_blocks(query, page_id, skip=skip, limit=limit)
+        it = self.get_store(req).find_blocks(query, page_id, skip=skip, limit=limit)
         return list(it)
 
     @route("POST", "/list/contents", tags=["contents"])
@@ -238,8 +272,9 @@ class DocServer(DocStoreInterface):
         block_id: str | None = None,
         skip: int = Query(default=0, ge=0),
         limit: int = Query(default=10, ge=1, le=1000),
+        req: Request = INJECT,
     ) -> list[Content]:
-        it = self.store.find_contents(query, page_id, block_id, skip=skip, limit=limit)
+        it = self.get_store(req).find_contents(query, page_id, block_id, skip=skip, limit=limit)
         return list(it)
 
     @route("POST", "/list/values", tags=["values"])
@@ -250,8 +285,9 @@ class DocServer(DocStoreInterface):
         key: str | None = None,
         skip: int = Query(default=0, ge=0),
         limit: int = Query(default=10, ge=1, le=1000),
+        req: Request = INJECT,
     ) -> list[Value]:
-        it = self.store.find_values(query, elem_id, key, skip=skip, limit=limit)
+        it = self.get_store(req).find_values(query, elem_id, key, skip=skip, limit=limit)
         return list(it)
 
     @route("POST", "/list/tasks", tags=["tasks"])
@@ -264,8 +300,9 @@ class DocServer(DocStoreInterface):
         create_user: str | None = None,
         skip: int = Query(default=0, ge=0),
         limit: int = Query(default=10, ge=1, le=1000),
+        req: Request = INJECT,
     ) -> list[Task]:
-        it = self.store.find_tasks(query, target, command, status, create_user, skip=skip, limit=limit)
+        it = self.get_store(req).find_tasks(query, target, command, status, create_user, skip=skip, limit=limit)
         return list(it)
 
     @route("POST", "/count/{elem_type}", tags=["others"])
@@ -275,62 +312,71 @@ class DocServer(DocStoreInterface):
         query: dict | list[dict] | None = None,
         query_from: ElemType | None = None,
         estimated: bool = False,
+        req: Request = INJECT,
     ) -> int:
-        return self.store.count(elem_type, query, query_from, estimated)
+        return self.get_store(req).count(elem_type, query, query_from, estimated)
 
     ####################
     # WRITE OPERATIONS #
     ####################
 
     @route("PUT", "/elements/{elem_id}/tags/{tag}", tags=["tags"])
-    def add_tag(self, elem_id: str, tag: str) -> None:
-        self.store.add_tag(elem_id, tag)
+    def add_tag(self, elem_id: str, tag: str, req: Request = INJECT) -> None:
+        self.get_store(req).add_tag(elem_id, tag)
 
     @route("DELETE", "/elements/{elem_id}/tags/{tag}", tags=["tags"])
-    def del_tag(self, elem_id: str, tag: str) -> None:
-        self.store.del_tag(elem_id, tag)
+    def del_tag(self, elem_id: str, tag: str, req: Request = INJECT) -> None:
+        self.get_store(req).del_tag(elem_id, tag)
 
     @route("PUT", "/elements/{elem_id}/metrics/{name}", tags=["metrics"])
-    def add_metric(self, elem_id: str, name: str, metric_input: MetricInput) -> None:
-        self.store.add_metric(elem_id, name, metric_input)
+    def add_metric(self, elem_id: str, name: str, metric_input: MetricInput, req: Request = INJECT) -> None:
+        self.get_store(req).add_metric(elem_id, name, metric_input)
 
     @route("DELETE", "/elements/{elem_id}/metrics/{name}", tags=["metrics"])
-    def del_metric(self, elem_id: str, name: str) -> None:
-        self.store.del_metric(elem_id, name)
+    def del_metric(self, elem_id: str, name: str, req: Request = INJECT) -> None:
+        self.get_store(req).del_metric(elem_id, name)
 
     @route("PUT", "/elements/{elem_id}/values/{key}", tags=["values"])
-    def insert_value(self, elem_id: str, key: str, value_input: ValueInput) -> Value:
-        return self.store.insert_value(elem_id, key, value_input)
+    def insert_value(self, elem_id: str, key: str, value_input: ValueInput, req: Request = INJECT) -> Value:
+        return self.get_store(req).insert_value(elem_id, key, value_input)
 
     @route("POST", "/elements/{target_id}/tasks", tags=["tasks"])
-    def insert_task(self, target_id: str, task_input: TaskInput) -> Task:
-        return self.store.insert_task(target_id, task_input)
+    def insert_task(self, target_id: str, task_input: TaskInput, req: Request = INJECT) -> Task:
+        return self.get_store(req).insert_task(target_id, task_input)
 
     @route("POST", "/docs", tags=["docs"])
-    def insert_doc(self, doc_input: DocInput, skip_ext_check: bool = False) -> Doc:
-        return self.store.insert_doc(doc_input, skip_ext_check)
+    def insert_doc(self, doc_input: DocInput, skip_ext_check: bool = False, req: Request = INJECT) -> Doc:
+        return self.get_store(req).insert_doc(doc_input, skip_ext_check)
 
     @route("POST", "/pages", tags=["pages"])
-    def insert_page(self, page_input: PageInput) -> Page:
-        return self.store.insert_page(page_input)
+    def insert_page(self, page_input: PageInput, req: Request = INJECT) -> Page:
+        return self.get_store(req).insert_page(page_input)
 
     @route("PUT", "/pages/{page_id}/layouts/{provider}", tags=["layouts"])
     def insert_layout(
-        self, page_id: str, provider: str, layout_input: LayoutInput, insert_blocks: bool = True, upsert: bool = False
+        self,
+        page_id: str,
+        provider: str,
+        layout_input: LayoutInput,
+        insert_blocks: bool = True,
+        upsert: bool = False,
+        req: Request = INJECT,
     ) -> Layout:
-        return self.store.insert_layout(page_id, provider, layout_input, insert_blocks, upsert)
+        return self.get_store(req).insert_layout(page_id, provider, layout_input, insert_blocks, upsert)
 
     @route("POST", "/pages/{page_id}/blocks", tags=["blocks"])
-    def insert_block(self, page_id: str, block_input: BlockInput) -> Block:
-        return self.store.insert_block(page_id, block_input)
+    def insert_block(self, page_id: str, block_input: BlockInput, req: Request = INJECT) -> Block:
+        return self.get_store(req).insert_block(page_id, block_input)
 
     @route("POST", "/pages/{page_id}/blocks/batch", tags=["blocks"])
-    def insert_blocks(self, page_id: str, blocks: list[BlockInput]) -> list[Block]:
-        return self.store.insert_blocks(page_id, blocks)
+    def insert_blocks(self, page_id: str, blocks: list[BlockInput], req: Request = INJECT) -> list[Block]:
+        return self.get_store(req).insert_blocks(page_id, blocks)
 
     @route("PUT", "/blocks/{block_id}/contents/{version}", tags=["contents"])
-    def insert_content(self, block_id: str, version: str, content_input: ContentInput, upsert: bool = False) -> Content:
-        return self.store.insert_content(block_id, version, content_input, upsert)
+    def insert_content(
+        self, block_id: str, version: str, content_input: ContentInput, upsert: bool = False, req: Request = INJECT
+    ) -> Content:
+        return self.get_store(req).insert_content(block_id, version, content_input, upsert)
 
     @route("PUT", "/pages/{page_id}/content-blocks-layouts/{provider}", tags=["layouts"])
     def insert_content_blocks_layout(
@@ -339,8 +385,9 @@ class DocServer(DocStoreInterface):
         provider: str,
         content_blocks: list[ContentBlockInput],
         upsert: bool = False,
+        req: Request = INJECT,
     ) -> Layout:
-        return self.store.insert_content_blocks_layout(page_id, provider, content_blocks, upsert)
+        return self.get_store(req).insert_content_blocks_layout(page_id, provider, content_blocks, upsert)
 
     ###################
     # TASK OPERATIONS #
@@ -354,8 +401,9 @@ class DocServer(DocStoreInterface):
         create_user: str | None = None,
         num: int = 10,
         hold_sec: int = 3600,
+        req: Request = INJECT,
     ) -> list[Task]:
-        return self.store.grab_new_tasks(command, args, create_user, num, hold_sec)
+        return self.get_store(req).grab_new_tasks(command, args, create_user, num, hold_sec)
 
     @route("POST", "/update-grabbed-task/{task_id}", tags=["tasks"])
     def update_grabbed_task(
@@ -364,8 +412,9 @@ class DocServer(DocStoreInterface):
         grab_time: int,
         status: Literal["done", "error", "skipped"],
         error_message: str | None = None,
+        req: Request = INJECT,
     ):
-        return self.store.update_grabbed_task(task_id, grab_time, status, error_message)
+        return self.get_store(req).update_grabbed_task(task_id, grab_time, status, error_message)
 
 
 def main():

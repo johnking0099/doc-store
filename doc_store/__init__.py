@@ -7,27 +7,36 @@ __lazy_attrs__ = {
     "ContentBlock": (".structs", "ContentBlock"),
     "PDFDocument": (".pdf_doc", "PDFDocument"),
     "DocStore": (".doc_store", "DocStore"),
-    "Doc": (".doc_store", "Doc"),
-    "Page": (".doc_store", "Page"),
-    "Layout": (".doc_store", "Layout"),
-    "Block": (".doc_store", "Block"),
-    "Content": (".doc_store", "Content"),
-    "Task": (".doc_store", "Task"),
-    "ElementExistsError": (".doc_store", "ElementExistsError"),
-    "DocExistsError": (".doc_store", "DocExistsError"),
+    "DocClient": (".doc_client", "DocClient"),
+    # interface
+    "Doc": (".interface", "Doc"),
+    "Page": (".interface", "Page"),
+    "Layout": (".interface", "Layout"),
+    "Block": (".interface", "Block"),
+    "Content": (".interface", "Content"),
+    "Value": (".interface", "Value"),
+    "Task": (".interface", "Task"),
+    "ElementNotFoundError": (".interface", "ElementNotFoundError"),
+    "ElementExistsError": (".interface", "ElementExistsError"),
+    "DocExistsError": (".interface", "DocExistsError"),
+    "TaskMismatchError": (".interface", "TaskMismatchError"),
 }
 
 if typing.TYPE_CHECKING:
-    from .doc_store import (
+    from .doc_client import DocClient
+    from .doc_store import DocStore
+    from .interface import (
         Block,
         Content,
         Doc,
         DocExistsError,
-        DocStore,
         ElementExistsError,
+        ElementNotFoundError,
         Layout,
         Page,
         Task,
+        TaskMismatchError,
+        Value,
     )
     from .pdf_doc import PDFDocument
     from .structs import BlockType, ContentBlock
@@ -58,12 +67,16 @@ __all__ = [
     "PDFDocument",
     "store",
     "DocStore",
+    "DocClient",
     "Doc",
     "Page",
     "Layout",
     "Block",
     "Content",
+    "Value",
     "Task",
+    "ElementNotFoundError",
     "ElementExistsError",
     "DocExistsError",
+    "TaskMismatchError",
 ]

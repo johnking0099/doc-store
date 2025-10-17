@@ -610,6 +610,29 @@ class DocStore(DocStoreInterface):
                 UserWarning,
             )
 
+    def impersonate(self, username: str) -> "DocStore":
+        """Impersonate another user for this DocStore instance."""
+        # use __new__ to bypass __init__
+        new_store = DocStore.__new__(DocStore)
+        new_store.coll_docs = self.coll_docs
+        new_store.coll_pages = self.coll_pages
+        new_store.coll_layouts = self.coll_layouts
+        new_store.coll_blocks = self.coll_blocks
+        new_store.coll_contents = self.coll_contents
+        new_store.coll_values = self.coll_values
+        new_store.coll_tasks = self.coll_tasks
+        new_store.coll_known_users = self.coll_known_users
+        new_store.coll_known_names = self.coll_known_names
+        new_store.coll_task_shortcuts = self.coll_task_shortcuts
+        new_store.locker = self.locker
+        new_store.measure_time = self.measure_time
+        new_store.times = {}
+        new_store._event_sink = self._event_sink
+        new_store.username = username
+        new_store.writable = username in new_store.known_users
+        new_store.user_info = new_store.known_users.get(username) or {}
+        return new_store
+
     def __enter__(self):
         return self
 
@@ -1137,7 +1160,7 @@ class DocStore(DocStoreInterface):
             return super_block
 
         if not self.try_get_page(page_id):
-            raise ValueError(f"Page with ID {page_id} does not exist.")
+            raise ElementNotFoundError(f"Page with ID {page_id} does not exist.")
 
         return self.insert_block(page_id, {"type": "super", "bbox": [0.0, 0.0, 1.0, 1.0]})
 

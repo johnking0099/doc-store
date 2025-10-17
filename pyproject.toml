@@ -21,8 +21,7 @@ dependencies = [
   "orjson",
   "pydantic",
   "numpy",
-  "fastapi",
-  "uvicorn[standard]",
+  "httpx",
 ]
 classifiers = [
   "Programming Language :: Python :: 3",
@@ -34,6 +33,12 @@ license-files = ["LICEN[CS]E*"]
 [project.urls]
 Homepage = "https://github.com/johnking0099/doc-store"
 Issues = "https://github.com/johnking0099/doc-store/issues"
+
+[project.optional-dependencies]
+server = [
+  "fastapi",
+  "uvicorn[standard]",
+]
 
 [tool.black]
 line-length = 128

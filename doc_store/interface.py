@@ -9,7 +9,7 @@ from PIL import Image
 from .io import read_file, read_image
 from .pdf_doc import PDFDocument
 from .s3 import head_s3_object, put_s3_object
-from .structs import ANGLE_OPTIONS, ContentBlock
+from .structs import ANGLE_OPTIONS
 from .utils import BlockingThreadPool, secs_to_readable
 
 #########
@@ -382,9 +382,9 @@ class Page(DocElement):
             limit=limit,
         )
 
-    def insert_layout(self, provider: str, layout_input: LayoutInput, insert_blocks=True) -> "Layout":
+    def insert_layout(self, provider: str, layout_input: LayoutInput, insert_blocks=True, upsert=False) -> "Layout":
         """Insert a layout for the page, return the inserted layout."""
-        return self.store.insert_layout(self.id, provider, layout_input, insert_blocks)
+        return self.store.insert_layout(self.id, provider, layout_input, insert_blocks, upsert)
 
     def upsert_layout(self, provider: str, layout_input: LayoutInput, insert_blocks=True) -> "Layout":
         """Upsert a layout for the page, return the inserted or updated layout."""
@@ -557,9 +557,9 @@ class Block(PageElement):
             limit=limit,
         )
 
-    def insert_content(self, version: str, content_input: ContentInput) -> "Content":
+    def insert_content(self, version: str, content_input: ContentInput, upsert=False) -> "Content":
         """Insert content for the block, return the inserted content."""
-        return self.store.insert_content(self.id, version, content_input)
+        return self.store.insert_content(self.id, version, content_input, upsert)
 
     def upsert_content(self, version: str, content_input: ContentInput) -> "Content":
         """Upsert content for the block, return the inserted or updated content."""
@@ -648,6 +648,14 @@ class Task(Element):
         if not status:
             raise ValueError("Task does not have a status.")
         return status
+
+    @property
+    def grab_time(self) -> int:
+        """Get the grab time of the task."""
+        grab_time = self.get("grab_time")
+        if grab_time is None:
+            raise ValueError("Task does not have a grab time.")
+        return grab_time
 
 
 class ElementNotFoundError(Exception):
