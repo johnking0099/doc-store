@@ -98,10 +98,15 @@ class KafkaConfig(BaseModel):
     topic: str = "test"
 
 
+class ServerConfig(BaseModel):
+    url: str | None = None
+
+
 class Config(BaseModel):
     s3: S3Config = S3Config()
     db: DBConfig = DBConfig()
     kafka: KafkaConfig = KafkaConfig()
+    server: ServerConfig = ServerConfig()
 
 
 config = Config(**_read_config())

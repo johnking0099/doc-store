@@ -3,6 +3,7 @@ from typing import Any, Iterable, Literal
 
 import httpx
 
+from .config import config
 from .interface import (
     Block,
     BlockInput,
@@ -32,17 +33,28 @@ from .utils import get_username
 class DocClient(DocStoreInterface):
     """HTTP client for DocStore API."""
 
-    def __init__(self, base_url: str = "http://localhost:8000", timeout: int = 300, connect_timeout: int = 30):
+    def __init__(
+        self,
+        server_url: str | None = None,
+        timeout: int = 300,
+        connect_timeout: int = 30,
+    ):
         """
         Initialize DocClient.
 
         Args:
-            base_url: Base URL of the DocStore API server
+            server_url: Base URL of the DocStore API server
             timeout: Read timeout in seconds (for stream requests, this is per-chunk)
             connect_timeout: Connection timeout in seconds
         """
         super().__init__()
-        self.base_url = base_url.rstrip("/")
+
+        if not server_url:
+            server_url = config.server.url
+        if not server_url:
+            raise ValueError("server_url must be provided either in argument or config.")
+        self.server_url = server_url.rstrip("/")
+
         self.client = httpx.Client(
             headers={
                 "X-Username": get_username(),
@@ -75,7 +87,7 @@ class DocClient(DocStoreInterface):
         params: dict | None = None,
     ) -> httpx.Response:
         """Make HTTP request to the server."""
-        url = f"{self.base_url}{path}"
+        url = f"{self.server_url}{path}"
 
         response = self.client.request(
             method=method,
@@ -87,7 +99,10 @@ class DocClient(DocStoreInterface):
         if response.status_code == 400:
             error_data = response.json()
             raise ValueError(error_data.get("message", "Bad request"))
-        if response.status_code == 404:
+        elif response.status_code == 403:
+            error_data = response.json()
+            raise PermissionError(error_data.get("message", "Permission denied"))
+        elif response.status_code == 404:
             error_data = response.json()
             raise ElementNotFoundError(error_data.get("message", "Element not found"))
         elif response.status_code == 409:
@@ -128,7 +143,7 @@ class DocClient(DocStoreInterface):
 
     def _stream(self, path: str, json_data: dict | list | None = None, params: dict | None = None) -> Iterable[dict]:
         """Make POST request and stream JSON lines response."""
-        url = f"{self.base_url}{path}"
+        url = f"{self.server_url}{path}"
 
         with self.client.stream("POST", url, json=json_data, params=params) as response:
             response.raise_for_status()

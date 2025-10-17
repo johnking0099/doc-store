@@ -117,6 +117,11 @@ class DocServer(DocStoreInterface):
                 status_code=status.HTTP_409_CONFLICT,
                 content={"error": "ElementExistsError", "message": str(e)},
             )
+        elif isinstance(e, PermissionError):
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"error": "PermissionError", "message": str(e)},
+            )
         elif isinstance(e, ValueError):
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,

@@ -1,7 +1,7 @@
 from doc_store import DocClient
 from doc_store.interface import DocExistsError, ElementExistsError, ElementNotFoundError
 
-store = DocClient(base_url="http://127.0.0.1:18080")
+store = DocClient(server_url="http://127.0.0.1:18080")
 
 
 print("# Read Docs")
