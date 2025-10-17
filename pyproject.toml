@@ -21,6 +21,8 @@ dependencies = [
   "orjson",
   "pydantic",
   "numpy",
+  "fastapi",
+  "uvicorn[standard]",
 ]
 classifiers = [
   "Programming Language :: Python :: 3",

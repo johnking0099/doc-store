@@ -1,57 +1,53 @@
 import base64
-import getpass
 import hashlib
 import io
-import os
 import random
 import re
-import threading
 import time
 import uuid
 import warnings
-from concurrent.futures import ThreadPoolExecutor
-from functools import cached_property, lru_cache, wraps
+from functools import cached_property, wraps
 from typing import Any, Callable, Iterable, Literal, TypeVar
 
 import numpy as np
 import pymongo.errors
 from bson.objectid import ObjectId
-from PIL import Image, ImageDraw
+from PIL import Image
 from pymongo import ReturnDocument
 from pymongo.database import Database
 
+from .interface import (
+    Block,
+    BlockInput,
+    Content,
+    ContentBlockInput,
+    ContentInput,
+    Doc,
+    DocExistsError,
+    DocInput,
+    DocStoreInterface,
+    ElementExistsError,
+    ElementNotFoundError,
+    ElemType,
+    Layout,
+    LayoutInput,
+    MetricInput,
+    Page,
+    PageInput,
+    Task,
+    TaskInput,
+    TaskMismatchError,
+    Value,
+    ValueInput,
+)
+from .io import read_file
 from .kafka import KafkaWriter
 from .mongodb import get_mongo_db
 from .pdf_doc import PDFDocument
-from .s3 import head_s3_object, put_s3_object, read_s3_object_bytes
 from .structs import ANGLE_OPTIONS, BLOCK_TYPES, CONTENT_FORMATS, ContentBlock
+from .utils import get_username
 
 Image.MAX_IMAGE_PIXELS = None
-
-
-@lru_cache
-def read_file(file_path: str, allow_local=True) -> bytes:
-    if file_path.startswith("s3://"):
-        return read_s3_object_bytes(file_path)
-    elif allow_local and os.path.isfile(file_path):
-        with open(file_path, "rb") as f:
-            return f.read()
-    raise ValueError(f"File {file_path} does not exist or is not accessible.")
-
-
-def read_image(file_path: str) -> Image.Image:
-    content = read_file(file_path)
-    image = Image.open(io.BytesIO(content))
-    try:
-        return image.convert("RGB")
-    except Exception:
-        # image is broken, return fake image
-        fake_size = [*image.size]
-        fake_image = Image.new("RGB", fake_size, (255, 255, 255))
-        draw = ImageDraw.Draw(fake_image)
-        draw.line((0, 0, *fake_size), fill=(255, 0, 0), width=10)
-        draw.line((0, fake_size[1], fake_size[0], 0), fill=(255, 0, 0), width=10)
-        return fake_image
 
 
 def encode_ndarray(array: np.ndarray) -> str:
@@ -63,24 +59,6 @@ def encode_ndarray(array: np.ndarray) -> str:
 def decode_ndarray(string: str) -> np.ndarray:
     with io.BytesIO(base64.b64decode(string)) as buffer:
         return np.load(buffer, allow_pickle=False)
-
-
-def _get_username() -> str:
-    """Get the current user name."""
-    username = getpass.getuser()
-    if not username:
-        username = os.getlogin()
-    if not username:
-        username = "unknown"
-    return username
-
-
-def _secs_to_readable(secs: int) -> str:
-    """Convert seconds to a human-readable format."""
-    hours, secs = secs // 3600, secs % 3600
-    minutes, secs = secs // 60, secs % 60
-    # return in 01:11:30 format
-    return f"{hours:02}:{minutes:02}:{secs:02}"
 
 
 def _get_docs_coll(db: Database):
@@ -299,7 +277,7 @@ def _get_values_coll(db: Database):
     #   "id": "value-01a0c73b-c25c-4d5b-a535-5b21c55c5fd3", // the unique value_id
     #
     #   /* Unique Index */
-    #   "target": "block-145f4ce9-8b22-4c8b-a448-e6546f8ebe5d",
+    #   "elem_id": "block-145f4ce9-8b22-4c8b-a448-e6546f8ebe5d",
     #   "key": "vit__embed_vector",
     #
     #   /* Main Fields */
@@ -311,7 +289,7 @@ def _get_values_coll(db: Database):
     # }
     coll_values = db.get_collection("values")
     coll_values.create_index([("id", 1)], unique=True)
-    coll_values.create_index([("target", 1), ("key", 1)], unique=True)
+    coll_values.create_index([("elem_id", 1), ("key", 1)], unique=True)
     coll_values.create_index([("key", 1)])
     return coll_values
 
@@ -414,611 +392,6 @@ class VersionalLocker:
         self.post_commit(key, locked_version)
 
 
-class BlockingThreadPool(ThreadPoolExecutor):
-    """A thread pool that blocks submission if the maximum number of workers is reached."""
-
-    def __init__(
-        self,
-        max_workers=None,
-        thread_name_prefix="",
-        initializer=None,
-        initargs=(),
-    ):
-        super().__init__(
-            max_workers=max_workers,
-            thread_name_prefix=thread_name_prefix,
-            initializer=initializer,
-            initargs=initargs,
-        )
-        print(f"max_workers={self._max_workers}")
-        self._semaphore = threading.Semaphore(self._max_workers)
-
-    def submit(self, fn, /, *args, **kwargs):
-        self._semaphore.acquire()
-        future = super().submit(fn, *args, **kwargs)
-        future.add_done_callback(lambda _: self._semaphore.release())
-        return future
-
-
-class _Element(dict):
-    """Base class for all elements."""
-
-    def __init__(self, mapping: dict, store: "DocStore"):
-        super().__init__(mapping)
-        self._store = store
-
-    def __getstate__(self) -> dict:
-        return dict(self)
-
-    def __setstate__(self, state: dict) -> None:
-        if not hasattr(self, "_store"):
-            self._store = None
-        self.clear()
-        self.update(state)
-
-    @property
-    def store(self) -> "DocStore":
-        """Get the store associated with this element."""
-        if not self._store:
-            raise ValueError("Element does not have a store.")
-        return self._store
-
-    @store.setter
-    def store(self, store: "DocStore") -> None:
-        """Set the store for this element."""
-        if not isinstance(store, DocStore):
-            raise TypeError("store must be an instance of DocStore.")
-        self._store = store
-
-    @cached_property
-    def id(self) -> str:
-        """The unique ID of the element."""
-        id = self.get("id")
-        if not id:
-            raise ValueError("Element does not have an ID.")
-        return id
-
-    @cached_property
-    def rid(self) -> int:
-        """A stable random number (not unique) for the element."""
-        rid = self.get("rid")
-        if isinstance(rid, int):
-            return rid
-        return int(self.id[-8:], 16) & 0x7FFFFFFF
-
-
-class _DocElement(_Element):
-    """Base class for all doc elements."""
-
-    @property
-    def tags(self) -> list[str]:
-        """Get tags of the element."""
-        return self.get("tags") or []
-
-    @property
-    def metrics(self) -> dict:
-        """Get metrics of the element."""
-        return self.get("metrics") or {}
-
-    def add_tag(self, tag: str) -> None:
-        """Add tag to an element."""
-        self.store.add_tag(self.__class__, self.id, tag)  # type: ignore
-        # update current instance
-        if tag not in self.tags:
-            self["tags"] = self.tags + [tag]
-
-    def del_tag(self, tag: str) -> None:
-        """Delete tag from an element."""
-        self.store.del_tag(self.__class__, self.id, tag)  # type: ignore
-        # update current instance
-        if tag in self.tags:
-            self["tags"] = [t for t in self.tags if t != tag]
-
-    def add_metric(self, name: str, value: float) -> None:
-        """Add metric to an element."""
-        self.store.add_metric(self.__class__, self.id, name, value)  # type: ignore
-        self["metrics"] = {**self.metrics, name: value}
-
-    def del_metric(self, name: str) -> None:
-        """Delete metric from an element."""
-        self.store.del_metric(self.__class__, self.id, name)  # type: ignore
-        self["metrics"] = {k: v for k, v in self.metrics.items() if k != name}
-
-    def try_get_value(self, key: str) -> "Value | None":
-        """Try to get a value by key."""
-        return self.store.try_get_value_by_target_and_key(self.id, key)
-
-    def get_value(self, key: str) -> "Value":
-        """Get a value by key."""
-        return self.store.get_value_by_target_and_key(self.id, key)
-
-    def find_values(
-        self,
-        query: dict | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable["Value"]:
-        """Find all values of the element."""
-        return self.store.find_values(
-            query=query,
-            target=self.id,
-            skip=skip,
-            limit=limit,
-        )
-
-    def insert_value(self, key: str, value: Any) -> "Value":
-        """Insert a value for the element."""
-        # TODO
-        return self.store.insert_value(self.id, key, value)
-
-    def find_tasks(
-        self,
-        query: dict | None = None,
-        command: str | None = None,
-        status: str | None = None,
-        create_user: str | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable["Task"]:
-        """List tasks of the element by filters."""
-        return self.store.find_tasks(
-            query=query,
-            target=self.id,
-            command=command,
-            status=status,
-            create_user=create_user,
-            skip=skip,
-            limit=limit,
-        )
-
-    def insert_task(self, command: str, args: dict[str, Any] = {}) -> "Task":
-        """Insert a task for the element."""
-        return self.store.insert_task(self.id, command, args)
-
-
-class Doc(_DocElement):
-    """Doc in the store."""
-
-    @property
-    def pdf(self) -> PDFDocument:
-        """Get the PDF document associated with the doc."""
-        return PDFDocument(self.pdf_bytes)
-
-    @cached_property
-    def pdf_path(self) -> str:
-        """Get the PDF path of the doc."""
-        pdf_path = self.get("pdf_path")
-        if not pdf_path:
-            raise ValueError("Doc does not have a PDF path.")
-        return pdf_path
-
-    @property
-    def pdf_bytes(self) -> bytes:
-        """Get the PDF bytes of the doc."""
-        return read_file(self.pdf_path)
-
-    @property
-    def num_pages(self) -> int:
-        """Return the number of pages in the doc."""
-        return self.get("num_pages", 0)
-
-    @property
-    def pages(self) -> list["Page"]:
-        """Get all pages of the doc."""
-        pages = list(self.find_pages())
-        pages.sort(key=lambda p: p.page_idx)
-        return pages
-
-    def find_pages(
-        self,
-        query: dict | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable["Page"]:
-        """List pages of the doc by filters."""
-        return self.store.find_pages(
-            query=query,
-            doc_id=self.id,
-            skip=skip,
-            limit=limit,
-        )
-
-    def insert_page(self, page_idx: int, page_data: dict) -> "Page":
-        """Insert a page for the doc, return the inserted page."""
-        return self.store.insert_page(page_data, doc_id=self.id, page_idx=page_idx)
-
-
-class Page(_DocElement):
-    """Page of a doc."""
-
-    @property
-    def image(self) -> Image.Image:
-        """Get the image of the page."""
-        return read_image(self.image_path)
-
-    @cached_property
-    def image_path(self) -> str:
-        """Get the image path of the page."""
-        image_path = self.get("image_path")
-        if not image_path:
-            raise ValueError("Page does not have an image path.")
-        return image_path
-
-    @property
-    def image_bytes(self) -> bytes:
-        """Get the image bytes of the page."""
-        return read_file(self.image_path)
-
-    @property
-    def image_pub_link(self) -> str:
-        """Get the public link of the page image."""
-        image_ext = self.image_path.split(".")[-1].lower()
-        if image_ext in ["jpg", "jpeg"]:
-            mime_type = "image/jpeg"
-        elif image_ext in ["png"]:
-            mime_type = "image/png"
-        else:
-            raise ValueError(f"Unsupported image format: {image_ext}.")
-
-        pub_path = f"ddp-pages/{self.id}.{image_ext}"
-        pub_s3_path = f"s3://pub-link/{pub_path}"
-        pub_link_url = f"https://pub-link.shlab.tech/{pub_path}"
-
-        if not head_s3_object(pub_s3_path):
-            put_s3_object(pub_s3_path, self.image_bytes, ContentType=mime_type)
-        return pub_link_url
-
-    @property
-    def super_block(self) -> "Block":
-        """Get the super block of the page."""
-        return self.store.get_super_block(self.id)
-
-    @property
-    def doc(self) -> Doc | None:
-        """Get the doc associated with the page."""
-        doc_id = self.get("doc_id")
-        return self.store.get_doc(doc_id) if doc_id else None
-
-    @property
-    def page_idx(self) -> int:
-        """Get the page index of the page."""
-        return self.get("page_idx", 0)
-
-    def try_get_layout(self, provider: str) -> "Layout | None":
-        """Try to get the layout of the page by provider."""
-        return self.store.try_get_layout_by_page_id_and_provider(self.id, provider)
-
-    def get_layout(self, provider: str) -> "Layout":
-        """Get the layout of the page by provider."""
-        return self.store.get_layout_by_page_id_and_provider(self.id, provider)
-
-    def find_layouts(
-        self,
-        query: dict | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable["Layout"]:
-        """List layouts of the page by filters."""
-        return self.store.find_layouts(
-            query=query,
-            page_id=self.id,
-            skip=skip,
-            limit=limit,
-        )
-
-    def find_blocks(
-        self,
-        query: dict | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable["Block"]:
-        """List blocks of the page by filters."""
-        return self.store.find_blocks(
-            query=query,
-            page_id=self.id,
-            skip=skip,
-            limit=limit,
-        )
-
-    def find_contents(
-        self,
-        query: dict | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable["Content"]:
-        """List contents of the page by filters."""
-        return self.store.find_contents(
-            query=query,
-            page_id=self.id,
-            skip=skip,
-            limit=limit,
-        )
-
-    def insert_layout(self, provider: str, layout_data: dict, insert_blocks=True) -> "Layout":
-        """Insert a layout for the page, return the inserted layout."""
-        return self.store.insert_layout(self.id, provider, layout_data, insert_blocks)
-
-    def upsert_layout(self, provider: str, layout_data: dict, insert_blocks=True) -> "Layout":
-        """Upsert a layout for the page, return the inserted or updated layout."""
-        return self.store.upsert_layout(self.id, provider, layout_data, insert_blocks)
-
-    def insert_block(self, block_data: dict) -> "Block":
-        """Insert a block for the page, return the inserted block."""
-        return self.store.insert_block(self.id, block_data)
-
-    def insert_blocks(self, blocks: list[dict]) -> list["Block"]:
-        """Insert multiple blocks for the page, return the inserted blocks."""
-        return self.store.insert_blocks(self.id, blocks)
-
-    def insert_content_blocks_layout(
-        self,
-        provider: str,
-        content_blocks: list[ContentBlock],
-        version: str | None = None,
-        upsert: bool = False,
-    ) -> "Layout":
-        """Insert a layout with content blocks for the page."""
-        return self.store.insert_content_blocks_layout(
-            self.id,
-            provider,
-            content_blocks,
-            version,
-            upsert,
-        )
-
-
-class _PageElement(_DocElement):
-    """Base class for elements that are associated with a page."""
-
-    @cached_property
-    def page_id(self) -> str:
-        """Page ID associated with this element."""
-        page_id = self.get("page_id")
-        if not page_id:
-            raise ValueError("Element does not have a page ID.")
-        return page_id
-
-    @property
-    def page(self) -> Page:
-        """Get the page associated with this element."""
-        return self.store.get_page(self.page_id)
-
-
-class Layout(_PageElement):
-    """Layout of a page, containing blocks and relations."""
-
-    @cached_property
-    def provider(self) -> str:
-        """Provider of the layout."""
-        provider = self.get("provider")
-        if not provider:
-            raise ValueError("Layout does not have a provider.")
-        return provider
-
-    @cached_property
-    def blocks(self) -> list["Block"]:
-        """Get all blocks of the layout."""
-        return self.get("blocks") or []
-
-    def list_versions(self) -> list[str]:
-        """List all content versions of the layout."""
-        block_ids = [block.id for block in self.blocks]
-        if not block_ids:
-            return []
-
-        versions = set()
-        query = {"block_id": {"$in": block_ids}}
-        for content in self.store.find_contents(query=query):
-            versions.add(content["version"])
-        return sorted(versions)
-
-    def list_contents(self, version: str) -> list["Content"]:
-        """Get all contents of the layout by version."""
-        if not version:
-            raise ValueError("Version must be specified to get contents.")
-
-        block_ids = [block.id for block in self.blocks]
-        if not block_ids:
-            return []
-
-        query = {"block_id": {"$in": block_ids}, "version": version}
-        return list(self.store.find_contents(query=query))
-
-
-class Block(_PageElement):
-    """Block of a page, representing a specific area with a type."""
-
-    @cached_property
-    def type(self) -> str:
-        """Type of the block."""
-        block_type = self.get("type")
-        if not block_type:
-            raise ValueError("Block does not have a type.")
-        return block_type
-
-    @cached_property
-    def bbox(self) -> list[float]:
-        """Bounding box of the block."""
-        bbox = self.get("bbox")
-        if not bbox:
-            raise ValueError("Block does not have a bounding box.")
-        return bbox
-
-    @cached_property
-    def angle(self) -> Literal[None, 0, 90, 180, 270]:
-        """Get the angle of the block."""
-        angle = self.get("angle")
-        if angle not in ANGLE_OPTIONS:
-            raise ValueError(f"Invalid angle: {angle}. Must be one of {ANGLE_OPTIONS}.")
-        return angle
-
-    @property
-    def image(self) -> Image.Image:
-        """Get the image of the block."""
-        bbox = self.bbox
-        angle = self.angle
-        image = self.page.image
-
-        x1, y1, x2, y2 = bbox
-        x1 = x1 * image.width
-        y1 = y1 * image.height
-        x2 = x2 * image.width
-        y2 = y2 * image.height
-
-        image = image.crop((x1, y1, x2, y2))
-        if angle:
-            image = image.rotate(angle, expand=True)
-        return image
-
-    @property
-    def image_bytes(self) -> bytes:
-        """Get the image bytes of the block."""
-        image = self.image
-        with io.BytesIO() as output:
-            image.save(output, format="PNG")
-            return output.getvalue()
-
-    @property
-    def image_pub_link(self) -> str:
-        """Get the public link of the page image."""
-        pub_path = f"ddp-blocks/{self.id}.png"
-        pub_s3_path = f"s3://pub-link/{pub_path}"
-        pub_link_url = f"https://pub-link.shlab.tech/{pub_path}"
-
-        if not head_s3_object(pub_s3_path):
-            put_s3_object(pub_s3_path, self.image_bytes, ContentType="image/png")
-        return pub_link_url
-
-    def try_get_content(self, version: str) -> "Content | None":
-        """Try to get the content of the block by version."""
-        return self.store.try_get_content_by_block_id_and_version(self.id, version)
-
-    def get_content(self, version: str) -> "Content":
-        """Get the content of the block by version."""
-        return self.store.get_content_by_block_id_and_version(self.id, version)
-
-    def find_contents(
-        self,
-        query: dict | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable["Content"]:
-        """List contents of the block by filters."""
-        return self.store.find_contents(
-            query=query,
-            block_id=self.id,
-            skip=skip,
-            limit=limit,
-        )
-
-    def insert_content(self, version: str, content_data: dict) -> "Content":
-        """Insert content for the block, return the inserted content."""
-        return self.store.insert_content(self.id, version, content_data)
-
-    def upsert_content(self, version: str, content_data: dict) -> "Content":
-        """Upsert content for the block, return the inserted or updated content."""
-        return self.store.upsert_content(self.id, version, content_data)
-
-
-class Content(_PageElement):
-    """Content of a block, representing the text or data within a block."""
-
-    @cached_property
-    def block_id(self) -> str:
-        """Block ID associated with this content."""
-        block_id = self.get("block_id")
-        if not block_id:
-            raise ValueError("Content does not have a block ID.")
-        return block_id
-
-    @property
-    def block(self) -> Block:
-        """Get the block associated with this content."""
-        return self.store.get_block(self.block_id)
-
-    @cached_property
-    def version(self) -> str:
-        """Version of the content."""
-        version = self.get("version")
-        if not version:
-            raise ValueError("Content does not have a version.")
-        return version
-
-
-class Value(_Element):
-    @property
-    def target(self) -> str:
-        """Get the target of the value."""
-        target = self.get("target")
-        if not target:
-            raise ValueError("Value does not have a target.")
-        return target
-
-    @property
-    def key(self) -> str:
-        """Get the key of the value."""
-        key = self.get("key")
-        if not key:
-            raise ValueError("Value does not have a key.")
-        return key
-
-    @property
-    def type(self) -> str | None:
-        """Get the type of the value."""
-        return self.get("type")
-
-    @property
-    def value(self) -> Any | None:
-        """Get the value."""
-        return self.get("value")
-
-
-class Task(_Element):
-    @property
-    def target(self) -> str:
-        """Get the target of the task."""
-        target = self.get("target")
-        if not target:
-            raise ValueError("Task does not have a target.")
-        return target
-
-    @property
-    def command(self) -> str:
-        """Get the command of the task."""
-        command = self.get("command")
-        if not command:
-            raise ValueError("Task does not have a command.")
-        return command
-
-    @property
-    def args(self) -> dict[str, Any]:
-        """Get the arguments of the task."""
-        return self.get("args") or {}
-
-    @property
-    def status(self) -> str:
-        """Get the status of the task."""
-        status = self.get("status")
-        if not status:
-            raise ValueError("Task does not have a status.")
-        return status
-
-
-class ElementExistsError(Exception):
-    pass
-
-
-class DocExistsError(ElementExistsError):
-    def __init__(self, message: str, pdf_path: str, pdf_hash: str | None):
-        super().__init__(message)
-        self.pdf_path = pdf_path
-        self.pdf_hash = pdf_hash
-
-
-class TaskMismatchError(Exception):
-    pass
-
-
 _KNOWN_FIELDS = {
     Doc: set(
         [
@@ -1080,7 +453,7 @@ _KNOWN_FIELDS = {
     ),
     Value: set(
         [
-            "target",
+            "elem_id",
             "key",
             "type",
             "value",
@@ -1207,7 +580,7 @@ class DocEvent(dict):
             self["tag_deleted"] = tag_deleted
 
 
-class DocStore:
+class DocStore(DocStoreInterface):
     def __init__(self, measure_time=False, disable_events=False):
         db = get_mongo_db()
         self.coll_docs = _get_docs_coll(db)
@@ -1228,7 +601,7 @@ class DocStore:
         if not disable_events:
             self._event_sink = KafkaWriter()
 
-        self.username = _get_username()
+        self.username = get_username()
         self.writable = self.username in self.known_users
         self.user_info = self.known_users.get(self.username) or {}
         if not self.writable:
@@ -1294,23 +667,41 @@ class DocStore:
         else:
             raise ValueError(f"Unknown element type {type_name}.")
 
-    def _get_coll(self, elem_type: type[T]):
-        if elem_type == Page:
+    def _get_coll(self, elem_type: ElemType | type[T]):
+        if elem_type == Page or elem_type == "page":
             return self.coll_pages
-        elif elem_type == Layout:
+        elif elem_type == Layout or elem_type == "layout":
             return self.coll_layouts
-        elif elem_type == Block:
+        elif elem_type == Block or elem_type == "block":
             return self.coll_blocks
-        elif elem_type == Content:
+        elif elem_type == Content or elem_type == "content":
             return self.coll_contents
-        elif elem_type == Doc:
+        elif elem_type == Doc or elem_type == "doc":
             return self.coll_docs
-        elif elem_type == Value:
+        elif elem_type == Value or elem_type == "value":
             return self.coll_values
-        elif elem_type == Task:
+        elif elem_type == Task or elem_type == "task":
             return self.coll_tasks
         else:
             raise ValueError(f"Unknown element type {elem_type}.")
+
+    def _get_elem_type_by_id(self, elem_id: str):
+        if elem_id.startswith("page-"):
+            return Page
+        elif elem_id.startswith("layout-"):
+            return Layout
+        elif elem_id.startswith("block-"):
+            return Block
+        elif elem_id.startswith("content-"):
+            return Content
+        elif elem_id.startswith("doc-"):
+            return Doc
+        elif elem_id.startswith("value-"):
+            return Value
+        elif elem_id.startswith("task-"):
+            return Task
+        # fallback to block
+        return Block
 
     def _dump_block(self, block_data: dict) -> dict:
         """Dump bbox in block data."""
@@ -1396,7 +787,7 @@ class DocStore:
         """Get an element by its type and query, raise ValueError if not found."""
         elem_data = self._try_get_elem(elem_type, query)
         if elem_data is None:
-            raise ValueError(f"{elem_type.__name__} with {query} not found.")
+            raise ElementNotFoundError(f"{elem_type.__name__} with {query} not found.")
         return elem_data
 
     @_measure_time
@@ -1446,7 +837,7 @@ class DocStore:
 
         if elem_type in DOC_ELEM_TYPES:
             for tag in elem_data.get("tags") or []:
-                self.add_tag(elem_type, elem_data["id"], tag)
+                self.add_tag(elem_data["id"], tag)
 
         return self._parse_elem(elem_type, elem_data)
 
@@ -1512,7 +903,7 @@ class DocStore:
             self._event_sink.write(event_data)
 
         for tag in elem_data.get("tags") or []:
-            self.add_tag(elem_type, elem_data["id"], tag)
+            self.add_tag(elem_data["id"], tag)
 
         return self._parse_elem(elem_type, result_data)
 
@@ -1649,436 +1040,9 @@ class DocStore:
 
         return blocks
 
-    def _distinct_values(
-        self,
-        elem_type: type[T],
-        field: Literal["tags", "provider", "version"],
-        query: dict | None = None,
-    ) -> list[str]:
-        """Get distinct values of a field for a given element type."""
-        coll = self._get_coll(elem_type)
-        return [v for v in coll.distinct(field, query) if v]
-
-    ###################
-    # READ OPERATIONS #
-    ###################
-
-    @_measure_time
-    def try_get(self, elem_id: str) -> DocElement | None:
-        """Try to get a element by its ID, return None if not found."""
-        if elem_id.startswith("doc-"):
-            return self.try_get_doc(elem_id)
-        if elem_id.startswith("page-"):
-            return self.try_get_page(elem_id)
-        if elem_id.startswith("layout-"):
-            return self.try_get_layout(elem_id)
-        if elem_id.startswith("block-"):
-            return self.try_get_block(elem_id)
-        if elem_id.startswith("content-"):
-            return self.try_get_content(elem_id)
-        # fallback to block
-        return self.try_get_block(elem_id)
-
-    @_measure_time
-    def get(self, elem_id: str) -> DocElement:
-        """Get a element by its ID."""
-        elem_data = self.try_get(elem_id)
-        if elem_data is None:
-            raise ValueError(f"Element with ID {elem_id} not found.")
-        return elem_data
-
-    @_measure_time
-    def try_get_doc(self, doc_id: str) -> Doc | None:
-        """Try to get a doc by its ID, return None if not found."""
-        return self._try_get_elem(Doc, {"id": doc_id})
-
-    @_measure_time
-    def get_doc(self, doc_id: str) -> Doc:
-        """Get a doc by its ID."""
-        return self._get_elem(Doc, {"id": doc_id})
-
-    @_measure_time
-    def try_get_doc_by_pdf_path(self, pdf_path: str) -> Doc | None:
-        """Try to get a doc by its PDF path, return None if not found."""
-        return self._try_get_elem(Doc, {"pdf_path": pdf_path})
-
-    @_measure_time
-    def get_doc_by_pdf_path(self, pdf_path: str) -> Doc:
-        """Get a doc by its PDF path."""
-        return self._get_elem(Doc, {"pdf_path": pdf_path})
-
-    @_measure_time
-    def try_get_doc_by_pdf_hash(self, pdf_hash: str) -> Doc | None:
-        """Try to get a doc by its PDF sha256sum hex-string, return None if not found."""
-        return self._try_get_elem(Doc, {"pdf_hash": pdf_hash.lower()})
-
-    @_measure_time
-    def get_doc_by_pdf_hash(self, pdf_hash: str) -> Doc:
-        """Get a doc by its PDF sha256sum hex-string."""
-        return self._get_elem(Doc, {"pdf_hash": pdf_hash.lower()})
-
-    @_measure_time
-    def try_get_page(self, page_id: str) -> Page | None:
-        """Try to get a page by its ID, return None if not found."""
-        return self._try_get_elem(Page, {"id": page_id})
-
-    @_measure_time
-    def get_page(self, page_id: str) -> Page:
-        """Get a page by its ID."""
-        return self._get_elem(Page, {"id": page_id})
-
-    @_measure_time
-    def try_get_page_by_image_path(self, image_path: str) -> Page | None:
-        """Try to get a page by its image path, return None if not found."""
-        return self._try_get_elem(Page, {"image_path": image_path})
-
-    @_measure_time
-    def get_page_by_image_path(self, image_path: str) -> Page:
-        """Get a page by its image path."""
-        return self._get_elem(Page, {"image_path": image_path})
-
-    @_measure_time
-    def try_get_layout(self, layout_id: str) -> Layout | None:
-        """Try to get a layout by its ID, return None if not found."""
-        return self._try_get_elem(Layout, {"id": layout_id})
-
-    @_measure_time
-    def get_layout(self, layout_id: str) -> Layout:
-        """Get a layout by its ID."""
-        return self._get_elem(Layout, {"id": layout_id})
-
-    @_measure_time
-    def try_get_layout_by_page_id_and_provider(self, page_id: str, provider: str) -> Layout | None:
-        """Try to get a layout by its page ID and provider, return None if not found."""
-        return self._try_get_elem(Layout, {"page_id": page_id, "provider": provider})
-
-    @_measure_time
-    def get_layout_by_page_id_and_provider(self, page_id: str, provider: str) -> Layout:
-        """Get a layout by its page ID and provider."""
-        return self._get_elem(Layout, {"page_id": page_id, "provider": provider})
-
-    @_measure_time
-    def try_get_block(self, block_id: str) -> Block | None:
-        """Try to get a block by its ID, return None if not found."""
-        return self._try_get_elem(Block, {"id": block_id})
-
-    @_measure_time
-    def get_block(self, block_id: str) -> Block:
-        """Get a block by its ID."""
-        return self._get_elem(Block, {"id": block_id})
-
-    @_measure_time
-    def get_super_block(self, page_id: str) -> Block:
-        """Get the super block for a page."""
-        # TODO: temp code
-        super_block = self._try_get_elem(Block, {"page_id": page_id, "type": ""})
-        if super_block is not None:
-            return super_block
-        # new code
-        super_block = self._try_get_elem(Block, {"page_id": page_id, "type": "super"})
-        if super_block is not None:
-            return super_block
-
-        if not self.try_get_page(page_id):
-            raise ValueError(f"Page with ID {page_id} does not exist.")
-
-        super_block_data = {"type": "super", "bbox": [0.0, 0.0, 1.0, 1.0]}
-        super_block = self.insert_block(page_id, super_block_data)
-        return super_block
-
-    @_measure_time
-    def try_get_content(self, content_id: str) -> Content | None:
-        """Try to get a content by its ID, return None if not found."""
-        return self._try_get_elem(Content, {"id": content_id})
-
-    @_measure_time
-    def get_content(self, content_id: str) -> Content:
-        """Get a content by its ID."""
-        return self._get_elem(Content, {"id": content_id})
-
-    @_measure_time
-    def try_get_content_by_block_id_and_version(self, block_id: str, version: str) -> Content | None:
-        """Try to get a content by its block ID and version, return None if not found."""
-        return self._try_get_elem(Content, {"block_id": block_id, "version": version})
-
-    @_measure_time
-    def get_content_by_block_id_and_version(self, block_id: str, version: str) -> Content:
-        """Get a content by its block ID and version."""
-        return self._get_elem(Content, {"block_id": block_id, "version": version})
-
-    @_measure_time
-    def try_get_value(self, value_id: str) -> Value | None:
-        """Try to get a value by its ID, return None if not found."""
-        return self._try_get_elem(Value, {"id": value_id})
-
-    @_measure_time
-    def get_value(self, value_id: str) -> Value:
-        """Get a value by its ID."""
-        return self._get_elem(Value, {"id": value_id})
-
-    @_measure_time
-    def try_get_value_by_target_and_key(self, target: str, key: str) -> Value | None:
-        """Try to get a value by its target and key, return None if not found."""
-        return self._try_get_elem(Value, {"target": target, "key": key})
-
-    @_measure_time
-    def get_value_by_target_and_key(self, target: str, key: str) -> Value:
-        """Get a value by its target and key."""
-        return self._get_elem(Value, {"target": target, "key": key})
-
-    @_measure_time
-    def try_get_task(self, task_id: str) -> Task | None:
-        """Try to get a task by its ID, return None if not found."""
-        return self._try_get_elem(Task, {"id": task_id})
-
-    @_measure_time
-    def get_task(self, task_id: str) -> Task:
-        """Get a task by its ID."""
-        return self._get_elem(Task, {"id": task_id})
-
-    def find(
-        self,
-        elem_type: type[T],
-        query: dict | list[dict] | None = None,
-        query_from: type[Q] | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable[T]:
-        query = query or {}
-        query_type = query_from or elem_type
-
-        is_pipeline = isinstance(query, list)
-        if query_type != elem_type and not is_pipeline:
-            raise ValueError("query_from can only be used in pipeline query.")
-
-        if is_pipeline:
-            pipeline = [*query]
-            if len(pipeline) > 0 and pipeline[0].get("$from"):
-                query_type = self._get_type(pipeline[0]["$from"])
-                pipeline = pipeline[1:]
-            if skip is not None:
-                pipeline.append({"$skip": skip})
-            if limit is not None:
-                pipeline.append({"$limit": limit})
-            coll = self._get_coll(query_type)
-            cursor = coll.aggregate(pipeline, maxTimeMS=86400000, batchSize=1000)
-        else:  # normal query
-            coll = self._get_coll(query_type)
-            cursor = coll.find(query, max_time_ms=86400000, batch_size=1000)
-            if skip is not None:
-                cursor = cursor.skip(skip)
-            if limit is not None:
-                cursor = cursor.limit(limit)
-        for layout in cursor:
-            yield self._parse_elem(elem_type, layout)
-
-    def find_docs(
-        self,
-        query: dict | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable[Doc]:
-        """List docs by filters."""
-        query = query or {}
-        return self.find(Doc, query, skip=skip, limit=limit)
-
-    def find_pages(
-        self,
-        query: dict | None = None,
-        doc_id: str | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable[Page]:
-        """List pages by filters."""
-        query = query or {}
-        if doc_id is not None:
-            query["doc_id"] = doc_id
-        return self.find(Page, query, skip=skip, limit=limit)
-
-    def find_layouts(
-        self,
-        query: dict | None = None,
-        page_id: str | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable[Layout]:
-        """List layouts by filters."""
-        query = query or {}
-        if page_id is not None:
-            query["page_id"] = page_id
-        return self.find(Layout, query, skip=skip, limit=limit)
-
-    def find_blocks(
-        self,
-        query: dict | None = None,
-        page_id: str | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable[Block]:
-        """List blocks by filters."""
-        query = query or {}
-        if page_id is not None:
-            query["page_id"] = page_id
-        return self.find(Block, query, skip=skip, limit=limit)
-
-    def find_contents(
-        self,
-        query: dict | None = None,
-        page_id: str | None = None,
-        block_id: str | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable[Content]:
-        """List contents by filters."""
-        query = query or {}
-        if page_id is not None:
-            query["page_id"] = page_id
-        if block_id is not None:
-            query["block_id"] = block_id
-        return self.find(Content, query, skip=skip, limit=limit)
-
-    def find_values(
-        self,
-        query: dict | None = None,
-        target: str | None = None,
-        key: str | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable[Value]:
-        """List values by filters."""
-        query = query or {}
-        if target is not None:
-            query["target"] = target
-        if key is not None:
-            query["key"] = key
-        return self.find(Value, query, skip=skip, limit=limit)
-
-    def find_tasks(
-        self,
-        query: dict | None = None,
-        target: str | None = None,
-        command: str | None = None,
-        status: str | None = None,
-        create_user: str | None = None,
-        skip: int | None = None,
-        limit: int | None = None,
-    ) -> Iterable[Task]:
-        """List tasks by filters."""
-        query = query or {}
-        if target is not None:
-            query["target"] = target
-        if command is not None:
-            query["command"] = command
-        if status is not None:
-            query["status"] = status
-        if create_user is not None:
-            query["create_user"] = create_user
-        return self.find(Task, query, skip=skip, limit=limit)
-
-    @_measure_time
-    def count(
-        self,
-        elem_type: type[T],
-        query: dict | list[dict] | None = None,
-        query_from: type[Q] | None = None,
-    ) -> int:
-        """Count elements of a specific type matching the query."""
-        query = query or {}
-        query_type = query_from or elem_type
-
-        is_pipeline = isinstance(query, list)
-        if query_type != elem_type and not is_pipeline:
-            raise ValueError("query_from can only be used in pipeline query.")
-
-        if not is_pipeline:
-            coll = self._get_coll(query_type)
-            return coll.count_documents(query)
-
-        pipeline = [*query]
-        if len(pipeline) > 0 and pipeline[0].get("$from"):
-            query_type = self._get_type(pipeline[0]["$from"])
-            pipeline = pipeline[1:]
-        pipeline.append({"$group": {"_id": 1, "n": {"$sum": 1}}})
-
-        coll = self._get_coll(query_type)
-        return int(next(coll.aggregate(pipeline))["n"])
-
-    def iterate(
-        self,
-        elem_type: type[T],
-        func: Callable[[int, T], None],
-        query: dict | list[dict] | None = None,
-        query_from: type[Q] | None = None,
-        max_workers: int = 10,
-        total: int | None = None,
-    ) -> None:
-        if query is None:
-            query = {}
-
-        if total is None:
-            print("Estimating element count...")
-            begin = time.time()
-            if not query:
-                coll = self._get_coll(elem_type)
-                cnt = coll.estimated_document_count()
-            else:
-                cnt = self.count(elem_type, query, query_from)
-            elapsed = round(time.time() - begin, 2)
-            print(f"Estimation done. Found {cnt} elements in {elapsed} seconds.")
-        else:
-            cnt = max(0, total)
-
-        print("Iterating over elements...")
-        begin = time.time()
-        cursor = self.find(elem_type, query, query_from)
-
-        last_report_time = time.time()
-        with BlockingThreadPool(max_workers) as executor:
-            for idx, elem_data in enumerate(cursor):
-                now = time.time()
-                if idx > 0 and (now - last_report_time) > 10:
-                    curr = str(idx).rjust(len(str(cnt)))
-                    curr = f"{curr}/{cnt}" if cnt > 0 else curr
-                    elapsed = round(now - begin, 2)
-                    rps = round(idx / elapsed, 2) if elapsed > 0 else idx
-                    message = f"Processed {curr} elements in {elapsed}s, {rps}r/s"
-                    if cnt > 0:
-                        prog = round(idx / cnt * 100, 2)
-                        remaining_secs = int(elapsed * (cnt - idx) / idx)
-                        rtime = _secs_to_readable(remaining_secs)
-                        message = f"[{prog:5.2f}%] {message}, remaining time: {rtime}"
-                    print(message)
-                    last_report_time = now
-                executor.submit(func, idx, elem_data)
-            executor.shutdown(wait=True)
-
-    def doc_tags(self) -> list[str]:
-        """Get all distinct tags for docs."""
-        return self._distinct_values(Doc, "tags")
-
-    def page_tags(self) -> list[str]:
-        """Get all distinct tags for pages."""
-        return self._distinct_values(Page, "tags")
-
-    def layout_providers(self) -> list[str]:
-        """Get all distinct layout providers."""
-        return self._distinct_values(Layout, "provider")
-
-    def layout_tags(self) -> list[str]:
-        """Get all distinct tags for layouts."""
-        return self._distinct_values(Layout, "tags")
-
-    def block_tags(self) -> list[str]:
-        """Get all distinct tags for blocks."""
-        return self._distinct_values(Block, "tags")
-
-    def content_versions(self) -> list[str]:
-        """Get all distinct content versions."""
-        return self._distinct_values(Content, "version")
-
-    def content_tags(self) -> list[str]:
-        """Get all distinct tags for contents."""
-        return self._distinct_values(Content, "tags")
+    ##############
+    # PROPERTIES #
+    ##############
 
     @cached_property
     def known_users(self) -> dict[str, dict]:
@@ -2116,15 +1080,185 @@ class DocStore:
                 shortcuts[name] = shortcut
         return shortcuts
 
+    ###################
+    # READ OPERATIONS #
+    ###################
+
+    @_measure_time
+    def get_doc(self, doc_id: str) -> Doc:
+        """Get a doc by its ID."""
+        return self._get_elem(Doc, {"id": doc_id})
+
+    @_measure_time
+    def get_doc_by_pdf_path(self, pdf_path: str) -> Doc:
+        """Get a doc by its PDF path."""
+        return self._get_elem(Doc, {"pdf_path": pdf_path})
+
+    @_measure_time
+    def get_doc_by_pdf_hash(self, pdf_hash: str) -> Doc:
+        """Get a doc by its PDF sha256sum hex-string."""
+        return self._get_elem(Doc, {"pdf_hash": pdf_hash.lower()})
+
+    @_measure_time
+    def get_page(self, page_id: str) -> Page:
+        """Get a page by its ID."""
+        return self._get_elem(Page, {"id": page_id})
+
+    @_measure_time
+    def get_page_by_image_path(self, image_path: str) -> Page:
+        """Get a page by its image path."""
+        return self._get_elem(Page, {"image_path": image_path})
+
+    @_measure_time
+    def get_layout(self, layout_id: str) -> Layout:
+        """Get a layout by its ID."""
+        return self._get_elem(Layout, {"id": layout_id})
+
+    @_measure_time
+    def get_layout_by_page_id_and_provider(self, page_id: str, provider: str) -> Layout:
+        """Get a layout by its page ID and provider."""
+        return self._get_elem(Layout, {"page_id": page_id, "provider": provider})
+
+    @_measure_time
+    def get_block(self, block_id: str) -> Block:
+        """Get a block by its ID."""
+        return self._get_elem(Block, {"id": block_id})
+
+    @_measure_time
+    def get_super_block(self, page_id: str) -> Block:
+        """Get the super block for a page."""
+        # TODO: temp code
+        super_block = self._try_get_elem(Block, {"page_id": page_id, "type": ""})
+        if super_block is not None:
+            return super_block
+        # new code
+        super_block = self._try_get_elem(Block, {"page_id": page_id, "type": "super"})
+        if super_block is not None:
+            return super_block
+
+        if not self.try_get_page(page_id):
+            raise ValueError(f"Page with ID {page_id} does not exist.")
+
+        return self.insert_block(page_id, {"type": "super", "bbox": [0.0, 0.0, 1.0, 1.0]})
+
+    @_measure_time
+    def get_content(self, content_id: str) -> Content:
+        """Get a content by its ID."""
+        return self._get_elem(Content, {"id": content_id})
+
+    @_measure_time
+    def get_content_by_block_id_and_version(self, block_id: str, version: str) -> Content:
+        """Get a content by its block ID and version."""
+        return self._get_elem(Content, {"block_id": block_id, "version": version})
+
+    @_measure_time
+    def get_value(self, value_id: str) -> Value:
+        """Get a value by its ID."""
+        return self._get_elem(Value, {"id": value_id})
+
+    @_measure_time
+    def get_value_by_elem_id_and_key(self, elem_id: str, key: str) -> Value:
+        """Get a value by its element ID and key."""
+        return self._get_elem(Value, {"elem_id": elem_id, "key": key})
+
+    @_measure_time
+    def get_task(self, task_id: str) -> Task:
+        """Get a task by its ID."""
+        return self._get_elem(Task, {"id": task_id})
+
+    @_measure_time
+    def distinct_values(
+        self,
+        elem_type: ElemType | type[T],
+        field: Literal["tags", "provider", "version"],
+        query: dict | None = None,
+    ) -> list[str]:
+        """Get distinct values of a field for a given element type."""
+        coll = self._get_coll(elem_type)
+        return [v for v in coll.distinct(field, query) if v]
+
+    def find(
+        self,
+        elem_type: ElemType | type[T],
+        query: dict | list[dict] | None = None,
+        query_from: ElemType | type[Q] | None = None,
+        skip: int | None = None,
+        limit: int | None = None,
+    ) -> Iterable[T]:
+        query = query or {}
+        query_type = query_from or elem_type
+
+        is_pipeline = isinstance(query, list)
+        if query_type != elem_type and not is_pipeline:
+            raise ValueError("query_from can only be used in pipeline query.")
+
+        if is_pipeline:
+            pipeline = [*query]
+            if len(pipeline) > 0 and pipeline[0].get("$from"):
+                query_type = self._get_type(pipeline[0]["$from"])
+                pipeline = pipeline[1:]
+            if skip is not None:
+                pipeline.append({"$skip": skip})
+            if limit is not None:
+                pipeline.append({"$limit": limit})
+            coll = self._get_coll(query_type)
+            cursor = coll.aggregate(pipeline, maxTimeMS=86400000, batchSize=1000)
+        else:  # normal query
+            coll = self._get_coll(query_type)
+            cursor = coll.find(query, max_time_ms=86400000, batch_size=1000)
+            if skip is not None:
+                cursor = cursor.skip(skip)
+            if limit is not None:
+                cursor = cursor.limit(limit)
+        parse_type = elem_type
+        if isinstance(elem_type, str):
+            parse_type = self._get_type(elem_type)
+        for layout in cursor:
+            yield self._parse_elem(parse_type, layout)  # type: ignore
+
+    @_measure_time
+    def count(
+        self,
+        elem_type: ElemType,
+        query: dict | list[dict] | None = None,
+        query_from: ElemType | None = None,
+        estimated: bool = False,
+    ) -> int:
+        """Count elements of a specific type matching the query."""
+        query = query or {}
+        query_type = query_from or elem_type
+
+        is_pipeline = isinstance(query, list)
+        if query_type != elem_type and not is_pipeline:
+            raise ValueError("query_from can only be used in pipeline query.")
+
+        if estimated and not query:
+            coll = self._get_coll(query_type)
+            return coll.estimated_document_count()
+
+        if not is_pipeline:
+            coll = self._get_coll(query_type)
+            return coll.count_documents(query)
+
+        pipeline = [*query]
+        if len(pipeline) > 0 and pipeline[0].get("$from"):
+            query_type = self._get_type(pipeline[0]["$from"])
+            pipeline = pipeline[1:]
+        pipeline.append({"$group": {"_id": 1, "n": {"$sum": 1}}})
+
+        coll = self._get_coll(query_type)
+        return int(next(coll.aggregate(pipeline))["n"])
+
     ####################
     # WRITE OPERATIONS #
     ####################
 
     @_measure_time
-    def add_tag(self, elem_type: type[DOC_ELEM], elem_id: str, tag: str) -> None:
+    def add_tag(self, elem_id: str, tag: str) -> None:
         """Add tag to an element."""
         self._check_writable()
         self._check_name("tag", tag)
+        elem_type = self._get_elem_type_by_id(elem_id)
         coll = self._get_coll(elem_type)
         now = int(time.time() * 1000)
         elem_data = coll.find_one_and_update(
@@ -2142,8 +1276,10 @@ class DocStore:
             shortcut = self.task_shortcuts.get(shortcut_name) or {}
             self.insert_task(
                 elem_id,
-                command=shortcut.get("command") or shortcut_name,
-                args=shortcut.get("args") or {},
+                {
+                    "command": shortcut.get("command") or shortcut_name,
+                    "args": shortcut.get("args") or {},
+                },
             )
         if self._event_sink is not None and elem_type != Task:
             event_data = DocEvent(
@@ -2159,10 +1295,11 @@ class DocStore:
             self._event_sink.write(event_data)
 
     @_measure_time
-    def del_tag(self, elem_type: type[DOC_ELEM], elem_id: str, tag: str) -> None:
+    def del_tag(self, elem_id: str, tag: str) -> None:
         """Delete tag from an element."""
         self._check_writable()
         self._check_name("tag", tag)
+        elem_type = self._get_elem_type_by_id(elem_id)
         coll = self._get_coll(elem_type)
         now = int(time.time() * 1000)
         elem_data = coll.find_one_and_update(
@@ -2188,12 +1325,18 @@ class DocStore:
             self._event_sink.write(event_data)
 
     @_measure_time
-    def add_metric(self, elem_type: type[DOC_ELEM], elem_id: str, name: str, value: int | float) -> None:
+    def add_metric(self, elem_id: str, name: str, metric_input: MetricInput) -> None:
         """Add a metric to an element."""
         self._check_writable()
         self._check_name("metric", name)
+
+        if not isinstance(metric_input, dict):
+            raise ValueError("metric_input must be a dictionary.")
+        value = metric_input.get("value")
         if not isinstance(value, (int, float)):
             raise ValueError("value must be an integer or a float.")
+
+        elem_type = self._get_elem_type_by_id(elem_id)
         coll = self._get_coll(elem_type)
         now = int(time.time() * 1000)
 
@@ -2207,10 +1350,11 @@ class DocStore:
             )
 
     @_measure_time
-    def del_metric(self, elem_type: type[DOC_ELEM], elem_id: str, name: str) -> None:
+    def del_metric(self, elem_id: str, name: str) -> None:
         """Delete a metric from an element."""
         self._check_writable()
         self._check_name("metric", name)
+        elem_type = self._get_elem_type_by_id(elem_id)
         coll = self._get_coll(elem_type)
         now = int(time.time() * 1000)
         coll.update_one(
@@ -2222,11 +1366,12 @@ class DocStore:
         )
 
     @_measure_time
-    def insert_doc(self, doc_data: dict, skip_ext_check=False) -> Doc:
+    def insert_doc(self, doc_input: DocInput, skip_ext_check=False) -> Doc:
         """Insert a new doc into the database."""
         self._check_writable()
-        if not isinstance(doc_data, dict):
-            raise ValueError("doc_data must be a dictionary.")
+        if not isinstance(doc_input, dict):
+            raise ValueError("doc_input must be a dictionary.")
+        doc_data = dict(doc_input)
 
         orig_path = doc_data.get("orig_path")
         if orig_path is not None:
@@ -2280,22 +1425,15 @@ class DocStore:
         return result
 
     @_measure_time
-    def insert_page(
-        self,
-        page_data: dict,
-        doc_id: str | None = None,
-        page_idx: int | None = None,
-    ) -> Page:
+    def insert_page(self, page_input: PageInput) -> Page:
         """Insert a new page into the database."""
         self._check_writable()
-        if not isinstance(page_data, dict):
-            raise ValueError("page_data must be a dictionary.")
+        if not isinstance(page_input, dict):
+            raise ValueError("page_input must be a dictionary.")
+        page_data = dict(page_input)
 
-        _doc_id = page_data.pop("doc_id", None)
-        _page_idx = page_data.pop("page_idx", None)
-
-        doc_id = _doc_id if doc_id is None else doc_id
-        page_idx = _page_idx if page_idx is None else page_idx
+        doc_id = page_data.pop("doc_id", None)
+        page_idx = page_data.pop("page_idx", None)
 
         if doc_id is not None:
             if not isinstance(doc_id, str):
@@ -2341,29 +1479,33 @@ class DocStore:
         return result
 
     @_measure_time
-    def insert_layout(self, page_id: str, provider: str, layout_data: dict, insert_blocks=True) -> Layout:
+    def insert_layout(self, page_id: str, provider: str, layout_input: LayoutInput, insert_blocks=True, upsert=False) -> Layout:
         """Insert a new layout into the database."""
         self._check_writable()
         self._check_name("provider", provider)
 
         if not page_id:
             raise ValueError("page_id must be provided.")
-        if not isinstance(layout_data, dict):
+        if not isinstance(layout_input, dict):
             raise ValueError("layout_data must be a dictionary.")
+        layout_data = dict(layout_input)
 
         blocks = layout_data.get("blocks")
         if not isinstance(blocks, list):
             raise ValueError("layout_data must contain 'blocks' as a list.")
-
         if not self.try_get_page(page_id):
             raise ValueError(f"Page with ID {page_id} does not exist.")
-        if self.try_get_layout_by_page_id_and_provider(page_id, provider):
+        if not upsert and self.try_get_layout_by_page_id_and_provider(page_id, provider):
             raise ElementExistsError(f"Layout for page {page_id} with provider {provider} already exists.")
 
         if insert_blocks:
             layout_data["blocks"] = self._insert_blocks(page_id, blocks)
         else:  # use unstored blocks
             layout_data["blocks"] = self._normalize_unstored_blocks(blocks)
+
+        if upsert:
+            query = {"page_id": page_id, "provider": provider}
+            return self._upsert_elem(Layout, query, layout_data)
 
         layout_data["page_id"] = page_id
         layout_data["provider"] = provider
@@ -2376,48 +1518,23 @@ class DocStore:
         return result
 
     @_measure_time
-    def upsert_layout(self, page_id: str, provider: str, layout_data: dict, insert_blocks=True) -> Layout:
-        """Upsert a layout for a page."""
-        self._check_writable()
-        self._check_name("provider", provider)
-
-        if not page_id:
-            raise ValueError("page_id must be provided.")
-        if not isinstance(layout_data, dict):
-            raise ValueError("layout_data must be a dictionary.")
-
-        blocks = layout_data.get("blocks")
-        if not isinstance(blocks, list):
-            raise ValueError("layout_data must contain 'blocks' as a list.")
-        if not self.try_get_page(page_id):
-            raise ValueError(f"Page with ID {page_id} does not exist.")
-
-        if insert_blocks:
-            layout_data["blocks"] = self._insert_blocks(page_id, blocks)
-        else:  # use unstored blocks
-            layout_data["blocks"] = self._normalize_unstored_blocks(blocks)
-
-        query = {"page_id": page_id, "provider": provider}
-        return self._upsert_elem(Layout, query, layout_data)
-
-    @_measure_time
-    def insert_block(self, page_id: str, block_data: dict) -> Block:
+    def insert_block(self, page_id: str, block_input: BlockInput) -> Block:
         """Insert a new block for a page."""
         self._check_writable()
 
         if not page_id:
             raise ValueError("page_id must be provided.")
-        if not isinstance(block_data, dict):
-            raise ValueError("block_data must be a dictionary.")
+        if not isinstance(block_input, dict):
+            raise ValueError("block_input must be a dictionary.")
         if not self.try_get_page(page_id):
             raise ValueError(f"Page with ID {page_id} does not exist.")
 
-        block = self._insert_blocks(page_id, [block_data])[0]
+        block = self._insert_blocks(page_id, [block_input])[0]  # type: ignore
         block["page_id"] = page_id
         return self._parse_elem(Block, block)
 
     @_measure_time
-    def insert_blocks(self, page_id: str, blocks: list[dict]) -> list[Block]:
+    def insert_blocks(self, page_id: str, blocks: list[BlockInput]) -> list[Block]:
         """Insert multiple blocks for a page."""
         self._check_writable()
 
@@ -2430,21 +1547,22 @@ class DocStore:
         if not self.try_get_page(page_id):
             raise ValueError(f"Page with ID {page_id} does not exist.")
 
-        blocks = self._insert_blocks(page_id, blocks)
-        for block in blocks:
+        inserted_blocks = self._insert_blocks(page_id, blocks)  # type: ignore
+        for block in inserted_blocks:
             block["page_id"] = page_id
-        return [self._parse_elem(Block, block) for block in blocks]
+        return [self._parse_elem(Block, block) for block in inserted_blocks]
 
     @_measure_time
-    def insert_content(self, block_id: str, version: str, content_data: dict) -> Content:
+    def insert_content(self, block_id: str, version: str, content_input: ContentInput, upsert=False) -> Content:
         """Insert a new content for a block."""
         self._check_writable()
         self._check_name("version", version)
 
         if not block_id:
             raise ValueError("block_id must be provided.")
-        if not isinstance(content_data, dict):
-            raise ValueError("content_data must be a dictionary.")
+        if not isinstance(content_input, dict):
+            raise ValueError("content_input must be a dictionary.")
+        content_data = dict(content_input)
 
         format = content_data.get("format")
         if not format:
@@ -2461,10 +1579,14 @@ class DocStore:
         block_data = self.try_get_block(block_id)
         if not block_data:
             raise ValueError(f"Block with ID {block_id} does not exist.")
+        content_data["page_id"] = block_data.get("page_id")
+
+        if upsert:
+            query = {"block_id": block_id, "version": version}
+            return self._upsert_elem(Content, query, content_data)
 
         content_data["block_id"] = block_id
         content_data["version"] = version
-        content_data["page_id"] = block_data.get("page_id")
 
         result = self._insert_elem(Content, content_data)
         if result is None:
@@ -2474,43 +1596,14 @@ class DocStore:
         return result
 
     @_measure_time
-    def upsert_content(self, block_id: str, version: str, content_data: dict) -> Content:
-        """Upsert content for a block."""
-        self._check_writable()
-        self._check_name("version", version)
-
-        if not block_id:
-            raise ValueError("block_id must be provided.")
-        if not isinstance(content_data, dict):
-            raise ValueError("content_data must be a dictionary.")
-
-        format = content_data.get("format")
-        if not format:
-            raise ValueError("content_data must contain 'format'.")
-        if format not in CONTENT_FORMATS:
-            raise ValueError(f"unknown content format: {format}.")
-
-        content = content_data.get("content")
-        if content is None:
-            raise ValueError("content_data must contain 'content'.")
-        if not isinstance(content, str):
-            raise ValueError("content must be a string.")
-
-        block_data = self.try_get_block(block_id)
-        if not block_data:
-            raise ValueError(f"Block with ID {block_id} does not exist.")
-
-        content_data["page_id"] = block_data.get("page_id")
-
-        query = {"block_id": block_id, "version": version}
-        return self._upsert_elem(Content, query, content_data)
-
-    @_measure_time
-    def insert_value(self, target: str, key: str, value: Any) -> Value:
+    def insert_value(self, elem_id: str, key: str, value_input: ValueInput) -> Value:
         """Insert a new value for a target."""
         self._check_writable()
         self._check_name("key", key)
+        if not isinstance(value_input, dict):
+            raise ValueError("value_input must be a dictionary.")
 
+        value = value_input.get("value")
         if not isinstance(value, (str, np.ndarray)):
             raise ValueError("value must be a string or numpy array.")
 
@@ -2520,24 +1613,28 @@ class DocStore:
             value = encode_ndarray(value)
 
         value_data = {
-            "target": target,
+            "elem_id": elem_id,
             "key": key,
             "type": value_type,
             "value": value,
         }
         result = self._insert_elem(Value, value_data)
         if result is None:
-            raise ElementExistsError(f"Value for target {target} and key {key} already exists.")
+            raise ElementExistsError(f"Value for element {elem_id} and key {key} already exists.")
         return result
 
     @_measure_time
-    def insert_task(self, target_id: str, command: str, args: dict[str, Any] = {}) -> Task:
+    def insert_task(self, target_id: str, task_input: TaskInput) -> Task:
         """Insert a new task into the database."""
         self._check_writable()
         if not target_id:
             raise ValueError("target_id must be provided.")
+        if not isinstance(task_input, dict):
+            raise ValueError("task_input must be a dictionary.")
+        command = task_input.get("command")
         if not isinstance(command, str) or not command:
             raise ValueError("command must be a non-empty string.")
+        args = task_input.get("args", {})
         if not isinstance(args, dict):
             raise ValueError("args must be a dictionary.")
         if any(not isinstance(k, str) for k in args.keys()):
@@ -2565,8 +1662,7 @@ class DocStore:
         self,
         page_id: str,
         provider: str,
-        content_blocks: list[ContentBlock],
-        version: str | None = None,
+        content_blocks: list[ContentBlockInput],
         upsert: bool = False,
     ) -> Layout:
         """Import content blocks and create a layout for a page."""
@@ -2575,16 +1671,17 @@ class DocStore:
             raise ValueError("page_id must be provided.")
         if not provider:
             raise ValueError("provider must be a non-empty string.")
-        if any(not isinstance(b, ContentBlock) for b in content_blocks):
-            raise ValueError("content_blocks must be a list of ContentBlock instances.")
 
         if not self.try_get_page(page_id):
             raise ValueError(f"Page with ID {page_id} does not exist.")
         if not upsert and self.try_get_layout_by_page_id_and_provider(page_id, provider):
             raise ElementExistsError(f"Layout for page {page_id} with provider {provider} already exists.")
 
-        # use provider as version if version is not provided
-        version = version if version else provider
+        parsed_blocks: list[ContentBlock] = []
+        for block in content_blocks:
+            if not isinstance(block, dict):
+                raise ValueError("Each content_block must be a dict.")
+            parsed_blocks.append(ContentBlock(**block))
 
         blocks = [
             {
@@ -2594,28 +1691,21 @@ class DocStore:
                 **({"score": b.score} if b.score is not None else {}),
                 **({"tags": b.block_tags} if b.block_tags else {}),
             }
-            for b in content_blocks
+            for b in parsed_blocks
         ]
         inserted_blocks = self._insert_blocks(page_id, blocks)
 
-        insert_layout_func = self.upsert_layout if upsert else self.insert_layout
-        insert_content_func = self.upsert_content if upsert else self.insert_content
-
-        for c, block in zip(content_blocks, inserted_blocks):
+        for c, block in zip(parsed_blocks, inserted_blocks):
             if c.content is not None:
                 try:
-                    insert_content_func(
-                        block["id"],
-                        version or provider,
-                        {
-                            "content": c.content,
-                            "format": c.format or "text",
-                            **({"tags": c.content_tags} if c.content_tags else {}),
-                        },
-                    )
+                    content_input = ContentInput({"content": c.content, "format": c.format or "text"})
+                    if c.content_tags:
+                        content_input["tags"] = c.content_tags
+                    self.insert_content(block["id"], provider, content_input, upsert=upsert)
                 except ElementExistsError:
                     pass
-        return insert_layout_func(page_id, provider, {"blocks": inserted_blocks})
+
+        return self.insert_layout(page_id, provider, {"blocks": inserted_blocks}, upsert=upsert)
 
     ###################
     # TASK OPERATIONS #
@@ -2692,31 +1782,24 @@ class DocStore:
     @_measure_time
     def update_grabbed_task(
         self,
-        task: dict,  # task object that just grabbed.
-        status: Literal["done", "error", "skipped"] = "done",
+        task_id: str,
+        grab_time: int,
+        status: Literal["done", "error", "skipped"],
         error_message: str | None = None,
     ):
         """Update a task after processing."""
         self._check_writable()
-        if task is None:
-            raise ValueError("task must not be None.")
-        if not isinstance(task, dict):
-            raise ValueError("task must be a dictionary.")
-        if not task.get("id"):
-            raise ValueError("task must contain 'id'.")
-        if not task.get("grab_time"):
-            raise ValueError("task must contain 'grab_time'.")
+        if not task_id:
+            raise ValueError("task ID must be provided.")
+        if not grab_time:
+            raise ValueError("grab_time must be provided.")
         if status not in ("done", "error", "skipped"):
             raise ValueError("status must be one of 'done', 'error', or 'skipped'.")
         if status == "error" and not error_message:
             raise ValueError("error_message must be provided if status is 'error'.")
 
         result = self.coll_tasks.update_one(
-            {
-                "id": task["id"],
-                "status": "new",
-                "grab_time": task["grab_time"],
-            },
+            {"id": task_id, "status": "new", "grab_time": grab_time},
             {
                 "$set": {
                     "status": status,
@@ -2728,7 +1811,7 @@ class DocStore:
         )
         if result.modified_count == 0:
             raise TaskMismatchError(
-                f"Task with ID {task['id']} not found or already updated.",
+                f"Task with ID {task_id} not found or already updated.",
             )
 
     def count_new_tasks(self) -> list[tuple[str, str, int]]:
