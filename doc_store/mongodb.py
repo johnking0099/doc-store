@@ -1,4 +1,3 @@
-import getpass
 import os
 import socket
 
@@ -6,21 +5,12 @@ import pymongo
 
 from .config import config
 from .json_util import json_dumps
+from .utils import get_username
 
 MAX_DOC_SIZE = 5 << 20  # 5MiB
 FLUSH_SIZE = 1 << 20  # 1MiB
 FLUSH_COUNT = 200
 MAX_RETRIES = 10
-
-
-def get_username() -> str:
-    """Get the current user name."""
-    username = getpass.getuser()
-    if not username:
-        username = os.getlogin()
-    if not username:
-        username = "unknown"
-    return username
 
 
 def get_mongo_client():

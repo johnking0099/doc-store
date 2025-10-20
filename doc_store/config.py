@@ -67,21 +67,21 @@ class DBConfig(BaseModel):
 
     @property
     def uri(self) -> str:
-        hosts = config.db.hosts
+        hosts = self.hosts
         if not hosts:
-            hosts = [DBHost(host=config.db.host, port=config.db.port)]
+            hosts = [DBHost(host=self.host, port=self.port)]
         hosts_str = ",".join(f"{h.host}:{h.port}" for h in hosts)
 
-        username = config.db.username
-        password = config.db.password
+        username = self.username
+        password = self.password
         password = urllib.parse.quote_plus(password)
-        database = config.db.database
+        database = self.database
 
-        options = {**config.db.extra_options}
-        if config.db.auth_source:
-            options["authSource"] = config.db.auth_source
-        if config.db.replica_set:
-            options["replicaSet"] = config.db.replica_set
+        options = {**self.extra_options}
+        if self.auth_source:
+            options["authSource"] = self.auth_source
+        if self.replica_set:
+            options["replicaSet"] = self.replica_set
         extra_options_str = "&".join(f"{k}={v}" for k, v in options.items())
 
         uri = f"mongodb://{username}:{password}@{hosts_str}/{database}"
