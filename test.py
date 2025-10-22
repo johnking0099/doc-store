@@ -1,7 +1,20 @@
-from doc_store import DocClient
-from doc_store.interface import DocExistsError, ElementExistsError, ElementNotFoundError
+from doc_store.doc_client import DocClient
+from doc_store.doc_store import DocStore
+from doc_store.interface import (
+    BlockInput,
+    ContentBlockInput,
+    ContentInput,
+    DocExistsError,
+    ElementExistsError,
+    ElementNotFoundError,
+    LayoutInput,
+    MetricInput,
+    TaskInput,
+    ValueInput,
+)
 
-store = DocClient(server_url="http://127.0.0.1:18080")
+store = DocClient(server_url="http://127.0.0.1:8081")
+# store = DocStore()
 
 
 print("# Read Docs")
@@ -56,11 +69,11 @@ assert store.try_get_doc_by_pdf_path("non/exist/path.pdf") is None
 ###
 
 print(" - Get doc by PDF hash")
-doc = store.get_doc_by_pdf_hash(test_doc["pdf_hash"])
+doc = store.get_doc_by_pdf_hash(test_doc.pdf_hash)
 assert doc.id == test_doc.id
 
 print(" - Try get doc by PDF hash")
-doc = store.try_get_doc_by_pdf_hash(test_doc["pdf_hash"])
+doc = store.try_get_doc_by_pdf_hash(test_doc.pdf_hash)
 assert doc is not None and doc.id == test_doc.id
 
 print(" - Get doc by non-exist PDF hash")
@@ -398,7 +411,7 @@ assert "tmp__test_tag" not in test_doc.tags
 ###
 
 print("# Add Metric")
-test_doc.add_metric("tmp__test_metric", {"value": 123.456})
+test_doc.add_metric("tmp__test_metric", MetricInput(value=123.456))
 test_doc = store.get_doc(test_doc.id)
 assert "tmp__test_metric" in test_doc.metrics
 assert test_doc.metrics["tmp__test_metric"] == 123.456
@@ -414,17 +427,17 @@ assert "tmp__test_metric" not in test_doc.metrics
 
 print("# Insert Value")
 try:
-    test_doc.insert_value("tmp__test_value", {"value": "some-value"})
+    test_doc.insert_value("tmp__test_value", ValueInput(value="some-value"))
 except ElementExistsError:
     pass
 test_value = test_doc.get_value("tmp__test_value")
-assert test_value["value"] == "some-value"
+assert test_value.value == "some-value"
 
 ###
 
 print("# Insert Task")
-test_doc.insert_task({"command": "tmp__command", "args": {"key1": "value1"}})
-assert any(task["command"] == "tmp__command" for task in test_doc.find_tasks())
+test_doc.insert_task(TaskInput(command="tmp__command", args={"key1": "value1"}))
+assert any(task.command == "tmp__command" for task in test_doc.find_tasks())
 
 ###
 
@@ -439,14 +452,14 @@ print("# Insert Page")
 print("# Insert Layout")
 layout = test_page.insert_layout(
     "tmp__test_provider",
-    {
-        "blocks": [
-            {"type": "text", "bbox": [0, 0, 0.9, 0.1]},
-            {"type": "text", "bbox": [0, 0.1, 0.9, 0.2]},
-            {"type": "text", "bbox": [0, 0.2, 0.9, 0.3]},
-            {"type": "text", "bbox": [0, 0.3, 0.9, 0.4]},
+    LayoutInput(
+        blocks=[
+            BlockInput(type="text", bbox=[0, 0, 0.9, 0.1]),
+            BlockInput(type="text", bbox=[0, 0.1, 0.9, 0.2]),
+            BlockInput(type="text", bbox=[0, 0.2, 0.9, 0.3]),
+            BlockInput(type="text", bbox=[0, 0.3, 0.9, 0.4]),
         ],
-    },
+    ),
     upsert=True,
 )
 print(layout)
@@ -454,7 +467,7 @@ print(layout)
 ###
 
 print("# Insert Block")
-block = test_page.insert_block({"type": "text", "bbox": [0, 0, 0.9, 0.1]})
+block = test_page.insert_block(BlockInput(type="text", bbox=[0, 0, 0.9, 0.1]))
 print(block)
 
 ###
@@ -462,10 +475,10 @@ print(block)
 print("# Insert Blocks")
 blocks = test_page.insert_blocks(
     [
-        {"type": "text", "bbox": [0, 0, 0.9, 0.1]},
-        {"type": "text", "bbox": [0, 0.1, 0.9, 0.2]},
-        {"type": "text", "bbox": [0, 0.2, 0.9, 0.3]},
-        {"type": "text", "bbox": [0, 0.3, 0.9, 0.4]},
+        BlockInput(type="text", bbox=[0, 0, 0.9, 0.1]),
+        BlockInput(type="text", bbox=[0, 0.1, 0.9, 0.2]),
+        BlockInput(type="text", bbox=[0, 0.2, 0.9, 0.3]),
+        BlockInput(type="text", bbox=[0, 0.3, 0.9, 0.4]),
     ]
 )
 print(blocks)
@@ -475,7 +488,7 @@ print(blocks)
 print("# Insert Content")
 content = block.insert_content(
     "tmp__test_content",
-    {"format": "text", "content": "This is a test content."},
+    ContentInput(format="text", content="This is a test content."),
     upsert=True,
 )
 print(content)
@@ -486,10 +499,10 @@ print("# Insert content_blocks_layout")
 layout = test_page.insert_content_blocks_layout(
     "tmp__test_provider",
     [
-        {"type": "text", "bbox": [0, 0, 0.9, 0.1], "content": "This is a test content 1."},
-        {"type": "text", "bbox": [0, 0.1, 0.9, 0.2], "content": "This is a test content 2."},
-        {"type": "text", "bbox": [0, 0.2, 0.9, 0.3], "content": "This is a test content 3."},
-        {"type": "text", "bbox": [0, 0.3, 0.9, 0.4], "content": "This is a test content 4."},
+        ContentBlockInput(type="text", bbox=[0, 0, 0.9, 0.1], content="This is a test content 1."),
+        ContentBlockInput(type="text", bbox=[0, 0.1, 0.9, 0.2], content="This is a test content 2."),
+        ContentBlockInput(type="text", bbox=[0, 0.2, 0.9, 0.3], content="This is a test content 3."),
+        ContentBlockInput(type="text", bbox=[0, 0.3, 0.9, 0.4], content="This is a test content 4."),
     ],
     upsert=True,
 )

@@ -17,11 +17,13 @@ from .interface import (
     ElementExistsError,
     ElementNotFoundError,
     ElemType,
+    InputModel,
     Layout,
     LayoutInput,
     MetricInput,
     Page,
     PageInput,
+    T,
     Task,
     TaskInput,
     Value,
@@ -153,6 +155,25 @@ class DocClient(DocStoreInterface):
                 if line:
                     yield json.loads(line)
 
+    def _dump_elem(self, elem_input: InputModel) -> dict:
+        """Dump element input model to dict for JSON serialization."""
+        if isinstance(elem_input, LayoutInput):
+            return {
+                "blocks": [self._dump_elem(b) for b in elem_input.blocks],
+                "relations": elem_input.relations,
+                "tags": elem_input.tags,
+            }
+        return elem_input.model_dump()
+
+    def _parse_elem(self, elem_type: type[T], elem_data: dict) -> T:
+        """Parse element data into the specified type."""
+        if elem_type == Layout:
+            blocks = elem_data.get("blocks") or []
+            elem_data["blocks"] = [self._parse_elem(Block, b) for b in blocks]
+        elem_object = elem_type(**elem_data)
+        elem_object.store = self
+        return elem_object
+
     ####################
     # READ OPERATIONS  #
     ####################
@@ -160,72 +181,72 @@ class DocClient(DocStoreInterface):
     def get_doc(self, doc_id: str) -> Doc:
         """Get a doc by its ID."""
         data = self._get(f"/docs/{doc_id}")
-        return Doc(data, self)
+        return self._parse_elem(Doc, data)
 
     def get_doc_by_pdf_path(self, pdf_path: str) -> Doc:
         """Get a doc by its PDF path."""
         data = self._get(f"/docs/pdf-path/{pdf_path}")
-        return Doc(data, self)
+        return self._parse_elem(Doc, data)
 
     def get_doc_by_pdf_hash(self, pdf_hash: str) -> Doc:
         """Get a doc by its PDF sha256sum hex-string."""
         data = self._get(f"/docs/pdf-hash/{pdf_hash}")
-        return Doc(data, self)
+        return self._parse_elem(Doc, data)
 
     def get_page(self, page_id: str) -> Page:
         """Get a page by its ID."""
         data = self._get(f"/pages/{page_id}")
-        return Page(data, self)
+        return self._parse_elem(Page, data)
 
     def get_page_by_image_path(self, image_path: str) -> Page:
         """Get a page by its image path."""
         data = self._get(f"/pages/image-path/{image_path}")
-        return Page(data, self)
+        return self._parse_elem(Page, data)
 
     def get_layout(self, layout_id: str) -> Layout:
         """Get a layout by its ID."""
         data = self._get(f"/layouts/{layout_id}")
-        return Layout(data, self)
+        return self._parse_elem(Layout, data)
 
     def get_layout_by_page_id_and_provider(self, page_id: str, provider: str) -> Layout:
         """Get a layout by its page ID and provider."""
         data = self._get(f"/pages/{page_id}/layouts/{provider}")
-        return Layout(data, self)
+        return self._parse_elem(Layout, data)
 
     def get_block(self, block_id: str) -> Block:
         """Get a block by its ID."""
         data = self._get(f"/blocks/{block_id}")
-        return Block(data, self)
+        return self._parse_elem(Block, data)
 
     def get_super_block(self, page_id: str) -> Block:
         """Get the super block for a page."""
         data = self._get(f"/pages/{page_id}/super-block")
-        return Block(data, self)
+        return self._parse_elem(Block, data)
 
     def get_content(self, content_id: str) -> Content:
         """Get a content by its ID."""
         data = self._get(f"/contents/{content_id}")
-        return Content(data, self)
+        return self._parse_elem(Content, data)
 
     def get_content_by_block_id_and_version(self, block_id: str, version: str) -> Content:
         """Get a content by its block ID and version."""
         data = self._get(f"/blocks/{block_id}/contents/{version}")
-        return Content(data, self)
+        return self._parse_elem(Content, data)
 
     def get_value(self, value_id: str) -> Value:
         """Get a value by its ID."""
         data = self._get(f"/values/{value_id}")
-        return Value(data, self)
+        return self._parse_elem(Value, data)
 
     def get_value_by_elem_id_and_key(self, elem_id: str, key: str) -> Value:
         """Get a value by its elem_id and key."""
         data = self._get(f"/elements/{elem_id}/values/{key}")
-        return Value(data, self)
+        return self._parse_elem(Value, data)
 
     def get_task(self, task_id: str) -> Task:
         """Get a task by its ID."""
         data = self._get(f"/tasks/{task_id}")
-        return Task(data, self)
+        return self._parse_elem(Task, data)
 
     def distinct_values(
         self,
@@ -234,7 +255,9 @@ class DocClient(DocStoreInterface):
         query: dict | None = None,
     ) -> list[str]:
         """Get all distinct values for a specific field of an element type."""
-        return self._post(f"/distinct/{elem_type}/{field}", json_data=query)  # type: ignore
+        data = self._post(f"/distinct/{elem_type}/{field}", json_data=query)
+        assert isinstance(data, list)
+        return data
 
     def find(
         self,
@@ -270,10 +293,11 @@ class DocClient(DocStoreInterface):
             "task": Task,
         }
 
-        elem_cls = elem_classes.get(elem_type, Element)  # type: ignore
+        assert isinstance(elem_type, str)
+        elem_cls = elem_classes.get(elem_type, Element)
 
         for data in self._stream(f"/stream/{elem_type}", json_data=query, params=params):
-            yield elem_cls(data, self)  # type: ignore
+            yield self._parse_elem(elem_cls, data)
 
     def count(
         self,
@@ -295,7 +319,9 @@ class DocClient(DocStoreInterface):
         if estimated:
             params["estimated"] = estimated
 
-        return self._post(f"/count/{elem_type}", json_data=query, params=params)  # type: ignore
+        data = self._post(f"/count/{elem_type}", json_data=query, params=params)
+        assert isinstance(data, int)
+        return data
 
     ####################
     # WRITE OPERATIONS #
@@ -311,7 +337,8 @@ class DocClient(DocStoreInterface):
 
     def add_metric(self, elem_id: str, name: str, metric_input: MetricInput) -> None:
         """Add a metric to an element."""
-        self._put(f"/elements/{elem_id}/metrics/{name}", json_data=dict(metric_input))
+        input_data = self._dump_elem(metric_input)
+        self._put(f"/elements/{elem_id}/metrics/{name}", json_data=input_data)
 
     def del_metric(self, elem_id: str, name: str) -> None:
         """Delete a metric from an element."""
@@ -319,53 +346,67 @@ class DocClient(DocStoreInterface):
 
     def insert_value(self, elem_id: str, key: str, value_input: ValueInput) -> Value:
         """Insert a new value for a element."""
-        data = self._put(f"/elements/{elem_id}/values/{key}", json_data=dict(value_input))
-        return Value(data, self)  # type: ignore
+        input_data = self._dump_elem(value_input)
+        data = self._put(f"/elements/{elem_id}/values/{key}", json_data=input_data)
+        assert isinstance(data, dict)
+        return self._parse_elem(Value, data)
 
     def insert_task(self, target_id: str, task_input: TaskInput) -> Task:
         """Insert a new task into the database."""
-        data = self._post(f"/elements/{target_id}/tasks", json_data=dict(task_input))
-        return Task(data, self)  # type: ignore
+        input_data = self._dump_elem(task_input)
+        data = self._post(f"/elements/{target_id}/tasks", json_data=input_data)
+        assert isinstance(data, dict)
+        return self._parse_elem(Task, data)
 
     def insert_doc(self, doc_input: DocInput, skip_ext_check=False) -> Doc:
         """Insert a new doc into the database."""
-        data = self._post("/docs", json_data=dict(doc_input), params={"skip_ext_check": skip_ext_check})
-        return Doc(data, self)  # type: ignore
+        input_data = self._dump_elem(doc_input)
+        data = self._post("/docs", json_data=input_data, params={"skip_ext_check": skip_ext_check})
+        assert isinstance(data, dict)
+        return self._parse_elem(Doc, data)
 
     def insert_page(self, page_input: PageInput) -> Page:
         """Insert a new page into the database."""
-        data = self._post("/pages", json_data=dict(page_input))
-        return Page(data, self)  # type: ignore
+        input_data = self._dump_elem(page_input)
+        data = self._post("/pages", json_data=input_data)
+        assert isinstance(data, dict)
+        return self._parse_elem(Page, data)
 
     def insert_layout(self, page_id: str, provider: str, layout_input: LayoutInput, insert_blocks=True, upsert=False) -> Layout:
         """Insert a new layout into the database."""
+        input_data = self._dump_elem(layout_input)
         data = self._put(
             f"/pages/{page_id}/layouts/{provider}",
-            json_data=dict(layout_input),
+            json_data=input_data,
             params={"insert_blocks": insert_blocks, "upsert": upsert},
         )
-        return Layout(data, self)  # type: ignore
+        assert isinstance(data, dict)
+        return self._parse_elem(Layout, data)
 
     def insert_block(self, page_id: str, block_input: BlockInput) -> Block:
         """Insert a new block for a page."""
-        data = self._post(f"/pages/{page_id}/blocks", json_data=dict(block_input))
-        return Block(data, self)  # type: ignore
+        input_data = self._dump_elem(block_input)
+        data = self._post(f"/pages/{page_id}/blocks", json_data=input_data)
+        assert isinstance(data, dict)
+        return self._parse_elem(Block, data)
 
     def insert_blocks(self, page_id: str, blocks: list[BlockInput]) -> list[Block]:
         """Insert multiple blocks for a page."""
-        # Send blocks as a list directly
-        data = self._post(f"/pages/{page_id}/blocks/batch", json_data=blocks)
-        return [Block(block_data, self) for block_data in data]  # type: ignore
+        input_data = [self._dump_elem(b) for b in blocks]
+        data = self._post(f"/pages/{page_id}/blocks/batch", json_data=input_data)
+        assert isinstance(data, list)
+        return [self._parse_elem(Block, block_data) for block_data in data]
 
     def insert_content(self, block_id: str, version: str, content_input: ContentInput, upsert=False) -> Content:
         """Insert a new content for a block."""
-        # Send content_input as body, upsert as query param
+        input_data = self._dump_elem(content_input)
         data = self._put(
             f"/blocks/{block_id}/contents/{version}",
-            json_data=dict(content_input),
+            json_data=input_data,
             params={"upsert": upsert},
         )
-        return Content(data, self)  # type: ignore
+        assert isinstance(data, dict)
+        return self._parse_elem(Content, data)
 
     def insert_content_blocks_layout(
         self,
@@ -375,13 +416,14 @@ class DocClient(DocStoreInterface):
         upsert: bool = False,
     ) -> Layout:
         """Import content blocks and create a layout for a page."""
-        # Send content_blocks as body (it's a list parameter), upsert as query param
+        input_data = [self._dump_elem(b) for b in content_blocks]
         data = self._put(
             f"/pages/{page_id}/content-blocks-layouts/{provider}",
-            json_data=content_blocks,
+            json_data=input_data,
             params={"upsert": upsert},
         )
-        return Layout(data, self)  # type: ignore
+        assert isinstance(data, dict)
+        return self._parse_elem(Layout, data)
 
     ###################
     # TASK OPERATIONS #
@@ -402,7 +444,7 @@ class DocClient(DocStoreInterface):
         params["num"] = num
         params["hold_sec"] = hold_sec
         data = self._post(f"/grab-new-tasks/{command}", json_data=args, params=params)
-        return [Task(task_data, self) for task_data in data]
+        return [self._parse_elem(Task, task_data) for task_data in data]
 
     def update_grabbed_task(
         self,

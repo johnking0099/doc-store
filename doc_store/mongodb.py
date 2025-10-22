@@ -21,7 +21,7 @@ def get_mongo_client():
     client = pymongo.MongoClient(
         db_uri,
         appname=f"DocStore({username}@{hostname}:{pid})",
-        minPoolSize=1,
+        minPoolSize=0,
         maxPoolSize=10,
         maxIdleTimeMS=10000,
     )

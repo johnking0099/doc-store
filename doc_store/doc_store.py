@@ -7,12 +7,13 @@ import time
 import uuid
 import warnings
 from functools import cached_property, wraps
-from typing import Any, Callable, Iterable, Literal, TypeVar
+from typing import Any, Callable, Iterable, Literal
 
 import numpy as np
 import pymongo.errors
 from bson.objectid import ObjectId
 from PIL import Image
+from pydantic import BaseModel
 from pymongo import ReturnDocument
 from pymongo.database import Database
 
@@ -34,6 +35,8 @@ from .interface import (
     MetricInput,
     Page,
     PageInput,
+    Q,
+    T,
     Task,
     TaskInput,
     TaskMismatchError,
@@ -392,89 +395,6 @@ class VersionalLocker:
         self.post_commit(key, locked_version)
 
 
-_KNOWN_FIELDS = {
-    Doc: set(
-        [
-            "orig_path",
-            "orig_filesize",
-            "orig_filename",
-            "orig_hash",
-            "pdf_path",
-            "pdf_filesize",
-            "pdf_filename",
-            "pdf_hash",
-            "num_pages",
-            "page_width",
-            "page_height",
-            "metadata",
-            "tags",
-        ]
-    ),
-    Page: set(
-        [
-            "doc_id",
-            "page_idx",
-            "image_path",
-            "image_filesize",
-            "image_hash",
-            "image_width",
-            "image_height",
-            "image_dpi",
-            "tags",
-        ]
-    ),
-    Layout: set(
-        [
-            "page_id",
-            "provider",
-            "blocks",
-            "relations",
-            "tags",
-        ]
-    ),
-    Block: set(
-        [
-            "page_id",
-            "type",
-            "bbox",
-            "angle",
-            "tags",
-        ]
-    ),
-    Content: set(
-        [
-            "block_id",
-            "version",
-            "page_id",
-            "format",
-            "content",
-            "tags",
-        ]
-    ),
-    Value: set(
-        [
-            "elem_id",
-            "key",
-            "type",
-            "value",
-        ]
-    ),
-    Task: set(
-        [
-            "target",
-            "command",
-            "args",
-            "status",
-            "create_user",
-            "update_user",
-            "grab_user",
-            "grab_time",
-            "error_message",
-        ]
-    ),
-}
-
-
 _TMP_TYPE_MAPPING = {
     "text_block": "text",
     "code_txt": "code",
@@ -536,15 +456,6 @@ def _measure_time(func):
     return wrapper
 
 
-T = TypeVar("T", bound=Doc | Page | Layout | Block | Content | Value | Task)
-Q = TypeVar("Q", bound=Doc | Page | Layout | Block | Content | Value | Task)
-TYPE = type[Doc | Page | Layout | Block | Content | Value | Task]
-
-DocElement = Doc | Page | Layout | Block | Content
-DOC_ELEM = TypeVar("DOC_ELEM", bound=DocElement)
-DOC_ELEM_TYPES = (Doc, Page, Layout, Block, Content)
-
-
 class DocEvent(dict):
     """Event class for document store events."""
 
@@ -578,6 +489,90 @@ class DocEvent(dict):
             self["tag_added"] = tag_added
         if tag_deleted is not None:
             self["tag_deleted"] = tag_deleted
+
+
+class Entity(BaseModel):
+    pass
+
+
+class TaggableEntity(Entity):
+    tags: list[str]
+
+
+class DocEntity(TaggableEntity):
+    pdf_path: str
+    pdf_filename: str | None
+    pdf_filesize: int
+    pdf_hash: str
+    num_pages: int
+    page_width: float
+    page_height: float
+    metadata: dict
+
+    # Original file info (if exists)
+    orig_path: str | None
+    orig_filename: str | None
+    orig_filesize: int | None
+    orig_hash: str | None
+
+
+class PageEntity(TaggableEntity):
+    doc_id: str | None
+    page_idx: int | None
+    image_path: str
+    image_filesize: int
+    image_hash: str
+    image_width: int
+    image_height: int
+    image_dpi: int | None
+
+
+class BlockEntity(TaggableEntity):
+    page_id: str
+    type: str
+    bbox: list[float]
+    angle: Literal[None, 0, 90, 180, 270]
+
+
+class LayoutBlockEntity(Entity):
+    id: str
+    type: str
+    bbox: list[float]
+    angle: Literal[None, 0, 90, 180, 270]
+
+
+class LayoutEntity(TaggableEntity):
+    page_id: str
+    provider: str
+    blocks: list[LayoutBlockEntity]
+    relations: list[dict]
+
+
+class ContentEntity(TaggableEntity):
+    block_id: str
+    version: str
+    page_id: str
+    format: str
+    content: str
+
+
+class ValueEntity(Entity):
+    elem_id: str
+    key: str
+    type: str
+    value: Any
+
+
+class TaskEntity(Entity):
+    target: str  # TODO: change
+    command: str
+    args: dict[str, Any]
+    status: str
+    create_user: str
+    update_user: str | None
+    grab_user: str | None
+    grab_time: int
+    error_message: str | None
 
 
 class DocStore(DocStoreInterface):
@@ -671,7 +666,7 @@ class DocStore(DocStoreInterface):
         """Generate a random number for an element."""
         return random.randint(0, (1 << 31) - 1)
 
-    def _get_type(self, type_name: str) -> TYPE:
+    def _get_type(self, type_name: str):
         type_name = type_name.lower()
         if type_name in ("page", "pages"):
             return Page
@@ -726,22 +721,35 @@ class DocStore(DocStoreInterface):
         # fallback to block
         return Block
 
-    def _dump_block(self, block_data: dict) -> dict:
-        """Dump bbox in block data."""
-        if "angle" not in block_data:
-            block_data["angle"] = None
-
-        bbox = block_data.get("bbox")
-        if not bbox:
-            bbox = [0.0, 0.0, 1.0, 1.0]
-            block_data["type"] = "super"
-        if isinstance(bbox, (list, tuple)):
-            x1, y1, x2, y2 = bbox
-            block_data["bbox"] = f"{x1:.4f},{y1:.4f},{x2:.4f},{y2:.4f}"
-            return block_data
-        if isinstance(bbox, str):
-            return block_data
-        raise ValueError("bbox must be a string or a list of floats.")
+    @_measure_time
+    def _dump_elem(self, entity: Entity) -> dict:
+        """Pre-process element data before insertion."""
+        if isinstance(entity, BlockEntity):
+            x1, y1, x2, y2 = entity.bbox
+            return {
+                "page_id": entity.page_id,
+                "type": entity.type,
+                "bbox": f"{x1:.4f},{y1:.4f},{x2:.4f},{y2:.4f}",
+                "angle": entity.angle,
+                "tags": entity.tags,
+            }
+        if isinstance(entity, LayoutBlockEntity):
+            x1, y1, x2, y2 = entity.bbox
+            return {
+                "id": entity.id,
+                "type": entity.type,
+                "bbox": f"{x1:.4f},{y1:.4f},{x2:.4f},{y2:.4f}",
+                "angle": entity.angle,
+            }
+        if isinstance(entity, LayoutEntity):
+            return {
+                "page_id": entity.page_id,
+                "provider": entity.provider,
+                "blocks": [self._dump_elem(b) for b in entity.blocks],
+                "relations": entity.relations,
+                "tags": entity.tags,
+            }
+        return entity.model_dump()
 
     def _parse_block(self, block_data: dict) -> dict:
         """Parse bbox in block data."""
@@ -766,16 +774,6 @@ class DocStore(DocStoreInterface):
         raise ValueError("bbox must be a string or a list of floats.")
 
     @_measure_time
-    def _dump_elem(self, elem_type: type[T], elem_data: dict) -> dict:
-        """Pre-process element data before insertion."""
-        if elem_type == Block:
-            elem_data = self._dump_block(elem_data)
-        elif elem_type == Layout:
-            blocks = elem_data.get("blocks") or []
-            elem_data["blocks"] = [self._dump_elem(Block, b) for b in blocks]
-        return elem_data
-
-    @_measure_time
     def _parse_elem(self, elem_type: type[T], elem_data: dict) -> T:
         """Post-process element data after retrieval or insertion."""
         _id: ObjectId | None = elem_data.pop("_id", None)  # Hide MongoDB's _id
@@ -785,25 +783,34 @@ class DocStore(DocStoreInterface):
         if "update_time" not in elem_data and elem_data.get("create_time"):
             elem_data["update_time"] = elem_data["create_time"]
 
+        if elem_data.get("rid") is None:
+            elem_id = elem_data.get("id") or "0"
+            elem_data["rid"] = int(elem_id[-8:], 16) & 0x7FFFFFFF
+
         if elem_type == Block:
             elem_data = self._parse_block(elem_data)
         elif elem_type == Layout:
+            page_id = elem_data.get("page_id") or ""
             blocks = elem_data.get("blocks") or []
+            for block_data in blocks:
+                block_data["page_id"] = page_id
+                print(block_data)
             elem_data["blocks"] = [self._parse_elem(Block, b) for b in blocks]
         elif elem_type == Content:
             elem_data["format"] = elem_data.get("format", "text")
-        if isinstance(elem_data, elem_type) and elem_data._store is self:
-            return elem_data
-        return elem_type(elem_data, self)
+
+        elem_object = elem_type(**elem_data)
+        elem_object.store = self
+        return elem_object
 
     @_measure_time
     def _try_get_elem(self, elem_type: type[T], query: dict) -> T | None:
         """Try to get an element by its type and query, return None if not found."""
         coll = self._get_coll(elem_type)
         elem_data = coll.find_one(query)
-        if elem_data is not None:
-            elem_data = self._parse_elem(elem_type, elem_data)
-        return elem_data
+        if elem_data is None:
+            return None
+        return self._parse_elem(elem_type, elem_data)
 
     @_measure_time
     def _get_elem(self, elem_type: type[T], query: dict) -> T:
@@ -814,32 +821,27 @@ class DocStore(DocStoreInterface):
         return elem_data
 
     @_measure_time
-    def _insert_elem(self, elem_type: type[T], elem_data: dict) -> T | None:
+    def _insert_elem(self, elem_type: type[T], entity: Entity) -> T | None:
         """Insert a new element into the database."""
         self._check_writable()
 
-        if not isinstance(elem_data, dict):
-            raise ValueError(f"{elem_type.__name__} data must be a dictionary.")
-        if "id" in elem_data:
-            raise ValueError(f"{elem_type.__name__} data should not contains 'id' field.")
+        if not isinstance(entity, Entity):
+            raise ValueError(f"entity must be an instance of Entity, not {type(entity)}.")
 
-        known_fields = _KNOWN_FIELDS.get(elem_type, set())
-        unknown_fields = [k for k in elem_data.keys() if k not in known_fields]
-        if unknown_fields:
-            raise ValueError(f"{elem_type.__name__} data has unknown fields: {unknown_fields}.")
-
-        for tag in elem_data.get("tags") or []:
-            self._check_name("tag", tag)
+        if isinstance(entity, TaggableEntity):
+            for tag in entity.tags:
+                self._check_name("tag", tag)
 
         coll = self._get_coll(elem_type)
 
         now = int(time.time() * 1000)
-        elem_data["id"] = self._new_id(elem_type)
-        elem_data["rid"] = self._rand_num()
-        elem_data["create_time"] = now
-        elem_data["update_time"] = now
-
-        elem_data = self._dump_elem(elem_type, elem_data)
+        elem_data = {
+            "id": self._new_id(elem_type),
+            "rid": self._rand_num(),
+            **self._dump_elem(entity),
+            "create_time": now,
+            "update_time": now,
+        }
 
         try:
             coll.insert_one(elem_data)
@@ -858,14 +860,15 @@ class DocStore(DocStoreInterface):
             )
             self._event_sink.write(event_data)
 
-        if elem_type in DOC_ELEM_TYPES:
+        # remove in future.
+        if isinstance(entity, TaggableEntity):
             for tag in elem_data.get("tags") or []:
                 self.add_tag(elem_data["id"], tag)
 
         return self._parse_elem(elem_type, elem_data)
 
     @_measure_time
-    def _upsert_elem(self, elem_type: type[T], query: dict, elem_data: dict) -> T:
+    def _upsert_elem(self, elem_type: type[T], query: dict, entity: Entity) -> T:
         """Upsert an element into the database."""
         self._check_writable()
 
@@ -873,49 +876,39 @@ class DocStore(DocStoreInterface):
             raise ValueError(f"Only Layout and Content can be upsert, not {elem_type.__name__}.")
         if not isinstance(query, dict) or not query:
             raise ValueError("query must be a non-empty dictionary.")
-        if not isinstance(elem_data, dict):
-            raise ValueError(f"{elem_type.__name__} update data must be a dictionary.")
-        if "id" in elem_data:
-            raise ValueError(f"{elem_type.__name__} data should not contains 'id' field.")
+        if not isinstance(entity, Entity):
+            raise ValueError(f"entity must be an instance of Entity, not {type(entity)}.")
 
+        elem_data = self._dump_elem(entity)
         for key, val in query.items():
             if key in elem_data and elem_data.pop(key) != val:
                 raise ValueError(f"Query key '{key}' value '{val}' does not match with update data.")
 
-        known_fields = _KNOWN_FIELDS.get(elem_type, set())
-        merged_fields = set(query.keys()).union(elem_data.keys())
-        unknown_fields = [k for k in merged_fields if k not in known_fields]
-        if unknown_fields:
-            raise ValueError(f"{elem_type.__name__} data has unknown fields: {unknown_fields}.")
-
-        for tag in elem_data.get("tags") or []:
-            self._check_name("tag", tag)
+        if isinstance(entity, TaggableEntity):
+            for tag in entity.tags:
+                self._check_name("tag", tag)
 
         coll = self._get_coll(elem_type)
 
         now = int(time.time() * 1000)
-        insert_data = {}
-        insert_data["id"] = self._new_id(elem_type)
-        insert_data["rid"] = self._rand_num()
-        insert_data["create_time"] = now
-        insert_data.update(query)
-
         elem_data["update_time"] = now
-        elem_data = self._dump_elem(elem_type, elem_data)
+        insert_data = {
+            "id": self._new_id(elem_type),
+            "rid": self._rand_num(),
+            **query,
+            "create_time": now,
+        }
 
         result_data = coll.find_one_and_update(
             query,
-            {
-                "$set": elem_data,
-                "$setOnInsert": insert_data,
-            },
+            {"$set": elem_data, "$setOnInsert": insert_data},
             upsert=True,
             return_document=ReturnDocument.AFTER,
         )
 
         if self._event_sink is not None:
             event_data = DocEvent(
-                elem_type=elem_type,  # type: ignore
+                elem_type=elem_type,
                 elem_id=result_data["id"],
                 event_type="insert",
                 event_user=self.username,
@@ -925,13 +918,15 @@ class DocStore(DocStoreInterface):
             )
             self._event_sink.write(event_data)
 
-        for tag in elem_data.get("tags") or []:
-            self.add_tag(elem_data["id"], tag)
+        # remove in future.
+        if isinstance(entity, TaggableEntity):
+            for tag in elem_data.get("tags") or []:
+                self.add_tag(elem_data["id"], tag)
 
         return self._parse_elem(elem_type, result_data)
 
     @_measure_time
-    def _try_insert_blocks(self, page_id: str, blocks: list[dict]) -> list[dict]:
+    def _try_insert_blocks(self, page_id: str, blocks: list[BlockInput]) -> list[Block]:
         """Try to insert blocks for a page, return list of inserted blocks."""
         self._check_writable()
 
@@ -941,57 +936,47 @@ class DocStore(DocStoreInterface):
         lock_key = f"page-blocks:{page_id}"
         locked_version = self.locker.read_ahead(lock_key)
 
+        result_blocks: list[Block] = []
         existing_blocks = list(self.find_blocks(page_id=page_id))
-        for block in blocks:
-            block_cmp_bbox = [round(num, 4) for num in block["bbox"]]
-
-            block_elem = None
+        for block_input in blocks:
+            block: Block | None = None
+            block_cmp_bbox = [round(num, 4) for num in block_input.bbox]
             for e_block in existing_blocks:
                 if (
-                    e_block["type"] == block["type"]
-                    and e_block.get("angle") == block.get("angle")
-                    and _block_overlap(e_block["bbox"], block_cmp_bbox) > 0.99
+                    e_block.type == block_input.type
+                    and e_block.angle == block_input.angle
+                    and _block_overlap(e_block.bbox, block_cmp_bbox) > 0.99
                 ):
-                    block_elem = e_block
+                    block = e_block
                     break
-            if block_elem is not None:
-                for tag in block.get("tags") or []:
-                    if tag not in block_elem.tags:
-                        block_elem.add_tag(tag)
-            else:  # block_data is None, should insert
-                insert_data = {
-                    "page_id": page_id,
-                    "bbox": block["bbox"],
-                    "type": block["type"],
-                    "angle": block.get("angle"),
-                    **({"tags": block["tags"]} if "tags" in block else {}),
-                }
-                block_elem = self._insert_elem(Block, insert_data)
-                if block_elem is None:
+            if block is not None:
+                for tag in block_input.tags or []:
+                    if tag not in block.tags:
+                        block.add_tag(tag)
+            else:  # block is None, should insert
+                block_entity = BlockEntity(
+                    page_id=page_id,
+                    type=block_input.type,
+                    bbox=block_input.bbox,
+                    angle=block_input.angle,
+                    tags=block_input.tags or [],
+                )
+                block = self._insert_elem(Block, block_entity)
+                if block is None:
                     raise ShouldRetryError()
-                existing_blocks.append(block_elem)
+                existing_blocks.append(block)
 
-            block["id"] = block_elem["id"]
-            block["bbox"] = block_elem["bbox"]
-            block["type"] = block_elem["type"]
-            block["angle"] = block_elem.get("angle")
+            result_blocks.append(block)
 
         self.locker.post_commit(lock_key, locked_version)
-        return blocks
+        return result_blocks
 
-    def _check_blocks(self, blocks: list[dict]) -> None:
-        for block_data in blocks:
-            if not isinstance(block_data, dict):
-                raise ValueError("Each block must be a dictionary.")
+    def _check_blocks(self, blocks: list[BlockInput]) -> None:
+        for block in blocks:
+            if not isinstance(block, BlockInput):
+                raise ValueError("Each block must be a BlockInput instance.")
 
-            bbox = block_data.get("bbox")
-            if bbox is None:
-                raise ValueError("block_data must contain 'bbox'.")
-            if isinstance(bbox, str):
-                bbox = list(map(float, bbox.split(",")))
-                block_data["bbox"] = bbox
-            if not isinstance(bbox, (list, tuple)):
-                raise ValueError("bbox must be a string or a list of floats.")
+            bbox = block.bbox
             if len(bbox) != 4:
                 raise ValueError("bbox must contain exactly 4 float values.")
             if not all(isinstance(x, (int, float)) for x in bbox):
@@ -1001,13 +986,13 @@ class DocStore(DocStoreInterface):
             if bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
                 raise ValueError("bbox values are invalid: x1 >= x2 or y1 >= y2.")
 
-            block_type = block_data.get("type")
+            block_type = block.type
             if not block_type:
-                raise ValueError("block_data must contain 'type'.")
+                raise ValueError("block type cannot be empty.")
             if block_type not in BLOCK_TYPES:
                 raise ValueError(f"unknown block type: {block_type}.")
 
-            block_angle = block_data.get("angle")
+            block_angle = block.angle
             if block_angle not in ANGLE_OPTIONS:
                 raise ValueError(f"Invalid angle: {block_angle}. Must be one of {ANGLE_OPTIONS}.")
 
@@ -1018,13 +1003,11 @@ class DocStore(DocStoreInterface):
                     raise ValueError("Super block cannot have angle.")
 
     @_measure_time
-    def _insert_blocks(self, page_id: str, blocks: list[dict]) -> list[dict]:
+    def _insert_blocks(self, page_id: str, blocks: list[BlockInput]) -> list[Block]:
         """Insert blocks for a page, return list of inserted blocks."""
         self._check_writable()
-
         if not blocks:
             return []
-
         self._check_blocks(blocks)
 
         retries = 0
@@ -1038,30 +1021,27 @@ class DocStore(DocStoreInterface):
                 if retries >= 10:
                     print(f"{type(e).__name__} after {retries} retries, retrying...")
 
-    def _normalize_unstored_blocks(self, blocks: list[dict]) -> list[dict]:
+    def _normalize_unstored_blocks(self, page_id: str, blocks: list[BlockInput]) -> list[Block]:
         """Normalize unstored blocks by ensuring they have IDs and valid bbox."""
         self._check_blocks(blocks)
 
-        for block in blocks:
-            if block.get("id"):
-                raise ValueError(f"Block data should not contains 'id' field.")
-            if block.pop("tags", None):
-                raise ValueError(f"Unstored block should not contains 'tags' field.")
-            if block.pop("page_id", None):
-                raise ValueError(f"Unstored block should not contains 'page_id' field.")
-            if block.pop("content", None) is not None:
-                raise ValueError(f"Unstored block should not contains 'content' field.")
+        if any(block_input.tags for block_input in blocks):
+            raise ValueError(f"Unstored block should not have tags.")
 
-            known_fields = _KNOWN_FIELDS.get(Block, set())
-            unknown_fields = [k for k in block.keys() if k not in known_fields]
-            if unknown_fields:
-                raise ValueError(f"Block data has unknown fields: {unknown_fields}.")
+        result_blocks: list[Block] = []
+        for block_input in blocks:
+            block = Block(
+                id=self._new_id(Block),
+                rid=0,
+                page_id=page_id,
+                type=block_input.type,
+                bbox=[round(num, 4) for num in block_input.bbox],
+                angle=block_input.angle,
+                tags=block_input.tags or [],
+            )
+            result_blocks.append(block)
 
-            block["bbox"] = [round(num, 4) for num in block["bbox"]]
-            block["angle"] = block.get("angle")
-            block["id"] = self._new_id(Block)
-
-        return blocks
+        return result_blocks
 
     ##############
     # PROPERTIES #
@@ -1162,7 +1142,7 @@ class DocStore(DocStoreInterface):
         if not self.try_get_page(page_id):
             raise ElementNotFoundError(f"Page with ID {page_id} does not exist.")
 
-        return self.insert_block(page_id, {"type": "super", "bbox": [0.0, 0.0, 1.0, 1.0]})
+        return self.insert_block(page_id, BlockInput(type="super", bbox=[0.0, 0.0, 1.0, 1.0]))
 
     @_measure_time
     def get_content(self, content_id: str) -> Content:
@@ -1233,11 +1213,12 @@ class DocStore(DocStoreInterface):
                 cursor = cursor.skip(skip)
             if limit is not None:
                 cursor = cursor.limit(limit)
+
         parse_type = elem_type
         if isinstance(elem_type, str):
             parse_type = self._get_type(elem_type)
-        for layout in cursor:
-            yield self._parse_elem(parse_type, layout)  # type: ignore
+        for elem_data in cursor:
+            yield self._parse_elem(parse_type, elem_data)  # type: ignore
 
     @_measure_time
     def count(
@@ -1299,10 +1280,10 @@ class DocStore(DocStoreInterface):
             shortcut = self.task_shortcuts.get(shortcut_name) or {}
             self.insert_task(
                 elem_id,
-                {
-                    "command": shortcut.get("command") or shortcut_name,
-                    "args": shortcut.get("args") or {},
-                },
+                TaskInput(
+                    command=shortcut.get("command") or shortcut_name,
+                    args=shortcut.get("args") or {},
+                ),
             )
         if self._event_sink is not None and elem_type != Task:
             event_data = DocEvent(
@@ -1353,11 +1334,10 @@ class DocStore(DocStoreInterface):
         self._check_writable()
         self._check_name("metric", name)
 
-        if not isinstance(metric_input, dict):
-            raise ValueError("metric_input must be a dictionary.")
-        value = metric_input.get("value")
-        if not isinstance(value, (int, float)):
-            raise ValueError("value must be an integer or a float.")
+        if not isinstance(metric_input, MetricInput):
+            raise ValueError("metric_input must be a MetricInput instance.")
+
+        value = metric_input.value
 
         elem_type = self._get_elem_type_by_id(elem_id)
         coll = self._get_coll(elem_type)
@@ -1392,24 +1372,21 @@ class DocStore(DocStoreInterface):
     def insert_doc(self, doc_input: DocInput, skip_ext_check=False) -> Doc:
         """Insert a new doc into the database."""
         self._check_writable()
-        if not isinstance(doc_input, dict):
-            raise ValueError("doc_input must be a dictionary.")
-        doc_data = dict(doc_input)
+        if not isinstance(doc_input, DocInput):
+            raise ValueError("doc_input must be a DocInput instance.")
 
-        orig_path = doc_data.get("orig_path")
+        orig_path = doc_input.orig_path
         if orig_path is not None:
-            if not isinstance(orig_path, str):
-                raise ValueError("orig_path must be a string.")
+            if not orig_path:
+                raise ValueError("orig_path must not be empty if provided.")
             if not orig_path.startswith(("/", "s3://")):
                 raise ValueError("orig_path must start with '/' or 's3://'.")
             if not orig_path.lower().endswith((".docx", ".doc", ".pptx", ".ppt")):
                 raise ValueError("orig_path must end with .docx, .doc, .pptx, or .ppt.")
 
-        pdf_path = doc_data.get("pdf_path")
+        pdf_path = doc_input.pdf_path
         if not pdf_path:
-            raise ValueError("doc_data must contain 'pdf_path'.")
-        if not isinstance(pdf_path, str):
-            raise ValueError("pdf_path must be a string.")
+            raise ValueError("pdf_path must be non-empty.")
         if not pdf_path.startswith(("/", "s3://")):
             raise ValueError("pdf_path must start with '/' or 's3://'.")
         if not skip_ext_check and not pdf_path.lower().endswith(".pdf"):
@@ -1421,29 +1398,40 @@ class DocStore(DocStoreInterface):
                 pdf_hash=None,
             )
 
+        orig_filesize: int | None = None
+        orig_hash: str | None = None
         if orig_path is not None:
             orig_content = read_file(orig_path, allow_local=False)
-            doc_data["orig_filesize"] = len(orig_content)
-            doc_data["orig_hash"] = hashlib.sha256(orig_content).hexdigest()
+            orig_filesize = len(orig_content)
+            orig_hash = hashlib.sha256(orig_content).hexdigest()
 
         pdf_content = read_file(pdf_path, allow_local=False)
         pdf_document = PDFDocument(pdf_content)
         if pdf_document.num_pages <= 0:
             raise ValueError(f"PDF document at {pdf_path} has no pages.")
 
-        doc_data["pdf_filesize"] = len(pdf_content)
-        doc_data["pdf_hash"] = hashlib.sha256(pdf_content).hexdigest()
-        doc_data["num_pages"] = pdf_document.num_pages
-        doc_data["page_width"] = pdf_document.page_width
-        doc_data["page_height"] = pdf_document.page_height
-        doc_data["metadata"] = pdf_document.metadata
+        doc_entity = DocEntity(
+            pdf_path=pdf_path,
+            pdf_filename=doc_input.pdf_filename,
+            pdf_filesize=len(pdf_content),
+            pdf_hash=hashlib.sha256(pdf_content).hexdigest(),
+            num_pages=pdf_document.num_pages,
+            page_width=pdf_document.page_width,
+            page_height=pdf_document.page_height,
+            metadata=pdf_document.metadata,
+            orig_path=orig_path,
+            orig_filename=doc_input.orig_filename,
+            orig_filesize=orig_filesize,
+            orig_hash=orig_hash,
+            tags=doc_input.tags or [],
+        )
 
-        result = self._insert_elem(Doc, doc_data)
+        result = self._insert_elem(Doc, doc_entity)
         if result is None:
             raise DocExistsError(
                 message=f"doc with pdf path {pdf_path} already exists.",
                 pdf_path=pdf_path,
-                pdf_hash=doc_data["pdf_hash"],
+                pdf_hash=doc_entity.pdf_hash,
             )
         return result
 
@@ -1451,35 +1439,28 @@ class DocStore(DocStoreInterface):
     def insert_page(self, page_input: PageInput) -> Page:
         """Insert a new page into the database."""
         self._check_writable()
-        if not isinstance(page_input, dict):
-            raise ValueError("page_input must be a dictionary.")
-        page_data = dict(page_input)
+        if not isinstance(page_input, PageInput):
+            raise ValueError("page_input must be a PageInput instance.")
 
-        doc_id = page_data.pop("doc_id", None)
-        page_idx = page_data.pop("page_idx", None)
+        doc_id = page_input.doc_id
+        page_idx = page_input.page_idx
 
         if doc_id is not None:
-            if not isinstance(doc_id, str):
-                raise ValueError("doc_id must be a string.")
             if not doc_id:
                 raise ValueError("doc_id must not be empty.")
             if page_idx is None:
                 raise ValueError("page_idx must be provided if doc_id is provided.")
-            if not isinstance(page_idx, int) or page_idx < 0:
+            if page_idx < 0:
                 raise ValueError("page_idx must be a non-negative integer.")
             doc = self.try_get_doc(doc_id)
             if doc is None:
                 raise ValueError(f"Doc with ID {doc_id} does not exist.")
             if page_idx >= doc.num_pages:
                 raise ValueError(f"page_idx {page_idx} is beyond {doc.num_pages} pages for doc {doc_id}.")
-            page_data["doc_id"] = doc_id
-            page_data["page_idx"] = page_idx
 
-        image_path = page_data.get("image_path")
+        image_path = page_input.image_path
         if not image_path:
-            raise ValueError("page_data must contain 'image_path'.")
-        if not isinstance(image_path, str):
-            raise ValueError("image_path must be a string.")
+            raise ValueError("image_path must be non-empty.")
         if not image_path.startswith(("/", "s3://")):
             raise ValueError("image_path must start with '/' or 's3://'.")
         if not image_path.lower().endswith((".jpg", ".jpeg", ".png")):
@@ -1491,12 +1472,19 @@ class DocStore(DocStoreInterface):
         image = Image.open(io.BytesIO(image_content))
         image = image.convert("RGB")  # Some broken image may raise.
 
-        page_data["image_filesize"] = len(image_content)
-        page_data["image_hash"] = hashlib.sha256(image_content).hexdigest()
-        page_data["image_width"] = image.width
-        page_data["image_height"] = image.height
+        page_entity = PageEntity(
+            doc_id=doc_id,
+            page_idx=page_idx,
+            image_path=image_path,
+            image_filesize=len(image_content),
+            image_hash=hashlib.sha256(image_content).hexdigest(),
+            image_width=image.width,
+            image_height=image.height,
+            image_dpi=page_input.image_dpi,
+            tags=page_input.tags or [],
+        )
 
-        result = self._insert_elem(Page, page_data)
+        result = self._insert_elem(Page, page_entity)
         if result is None:
             raise ElementExistsError(f"page with image path {image_path} already exists.")
         return result
@@ -1509,31 +1497,39 @@ class DocStore(DocStoreInterface):
 
         if not page_id:
             raise ValueError("page_id must be provided.")
-        if not isinstance(layout_input, dict):
-            raise ValueError("layout_data must be a dictionary.")
-        layout_data = dict(layout_input)
-
-        blocks = layout_data.get("blocks")
-        if not isinstance(blocks, list):
-            raise ValueError("layout_data must contain 'blocks' as a list.")
+        if not isinstance(layout_input, LayoutInput):
+            raise ValueError("layout_data must be a LayoutInput instance.")
         if not self.try_get_page(page_id):
             raise ValueError(f"Page with ID {page_id} does not exist.")
         if not upsert and self.try_get_layout_by_page_id_and_provider(page_id, provider):
             raise ElementExistsError(f"Layout for page {page_id} with provider {provider} already exists.")
 
         if insert_blocks:
-            layout_data["blocks"] = self._insert_blocks(page_id, blocks)
+            blocks = self._insert_blocks(page_id, layout_input.blocks)
         else:  # use unstored blocks
-            layout_data["blocks"] = self._normalize_unstored_blocks(blocks)
+            blocks = self._normalize_unstored_blocks(page_id, layout_input.blocks)
+
+        layout_entity = LayoutEntity(
+            page_id=page_id,
+            provider=provider,
+            blocks=[
+                LayoutBlockEntity(
+                    id=block.id,
+                    type=block.type,
+                    bbox=block.bbox,
+                    angle=block.angle,
+                )
+                for block in blocks
+            ],
+            relations=layout_input.relations or [],
+            tags=layout_input.tags or [],
+        )
 
         if upsert:
             query = {"page_id": page_id, "provider": provider}
-            return self._upsert_elem(Layout, query, layout_data)
+            return self._upsert_elem(Layout, query, layout_entity)
 
-        layout_data["page_id"] = page_id
-        layout_data["provider"] = provider
-
-        result = self._insert_elem(Layout, layout_data)
+        result = self._insert_elem(Layout, layout_entity)
         if result is None:
             raise ElementExistsError(
                 f"Layout for page {page_id} with provider {provider} already exists.",
@@ -1544,36 +1540,27 @@ class DocStore(DocStoreInterface):
     def insert_block(self, page_id: str, block_input: BlockInput) -> Block:
         """Insert a new block for a page."""
         self._check_writable()
-
         if not page_id:
             raise ValueError("page_id must be provided.")
-        if not isinstance(block_input, dict):
-            raise ValueError("block_input must be a dictionary.")
+        if not isinstance(block_input, BlockInput):
+            raise ValueError("block_input must be a BlockInput instance.")
         if not self.try_get_page(page_id):
             raise ValueError(f"Page with ID {page_id} does not exist.")
-
-        block = self._insert_blocks(page_id, [block_input])[0]  # type: ignore
-        block["page_id"] = page_id
-        return self._parse_elem(Block, block)
+        return self._insert_blocks(page_id, [block_input])[0]
 
     @_measure_time
     def insert_blocks(self, page_id: str, blocks: list[BlockInput]) -> list[Block]:
         """Insert multiple blocks for a page."""
         self._check_writable()
-
         if not page_id:
             raise ValueError("page_id must be provided.")
         if not isinstance(blocks, list):
-            raise ValueError("blocks must be a list of dictionaries.")
+            raise ValueError("blocks must be a list of BlockInput instances.")
         if not blocks:
             return []
         if not self.try_get_page(page_id):
             raise ValueError(f"Page with ID {page_id} does not exist.")
-
-        inserted_blocks = self._insert_blocks(page_id, blocks)  # type: ignore
-        for block in inserted_blocks:
-            block["page_id"] = page_id
-        return [self._parse_elem(Block, block) for block in inserted_blocks]
+        return self._insert_blocks(page_id, blocks)
 
     @_measure_time
     def insert_content(self, block_id: str, version: str, content_input: ContentInput, upsert=False) -> Content:
@@ -1583,35 +1570,33 @@ class DocStore(DocStoreInterface):
 
         if not block_id:
             raise ValueError("block_id must be provided.")
-        if not isinstance(content_input, dict):
-            raise ValueError("content_input must be a dictionary.")
-        content_data = dict(content_input)
+        if not isinstance(content_input, ContentInput):
+            raise ValueError("content_input must be a ContentInput instance.")
 
-        format = content_data.get("format")
+        format = content_input.format
         if not format:
-            raise ValueError("content_data must contain 'format'.")
+            raise ValueError("content_input must contain 'format'.")
         if format not in CONTENT_FORMATS:
             raise ValueError(f"unknown content format: {format}.")
 
-        content = content_data.get("content")
-        if content is None:
-            raise ValueError("content_data must contain 'content'.")
-        if not isinstance(content, str):
-            raise ValueError("content must be a string.")
-
-        block_data = self.try_get_block(block_id)
-        if not block_data:
+        block = self.try_get_block(block_id)
+        if block is None:
             raise ValueError(f"Block with ID {block_id} does not exist.")
-        content_data["page_id"] = block_data.get("page_id")
+
+        content_entity = ContentEntity(
+            block_id=block_id,
+            version=version,
+            page_id=block.page_id,
+            format=format,
+            content=content_input.content,
+            tags=content_input.tags or [],
+        )
 
         if upsert:
             query = {"block_id": block_id, "version": version}
-            return self._upsert_elem(Content, query, content_data)
+            return self._upsert_elem(Content, query, content_entity)
 
-        content_data["block_id"] = block_id
-        content_data["version"] = version
-
-        result = self._insert_elem(Content, content_data)
+        result = self._insert_elem(Content, content_entity)
         if result is None:
             raise ElementExistsError(
                 f"Content for block {block_id} with version {version} already exists.",
@@ -1623,10 +1608,10 @@ class DocStore(DocStoreInterface):
         """Insert a new value for a target."""
         self._check_writable()
         self._check_name("key", key)
-        if not isinstance(value_input, dict):
-            raise ValueError("value_input must be a dictionary.")
+        if not isinstance(value_input, ValueInput):
+            raise ValueError("value_input must be a ValueInput instance.")
 
-        value = value_input.get("value")
+        value = value_input.value
         if not isinstance(value, (str, np.ndarray)):
             raise ValueError("value must be a string or numpy array.")
 
@@ -1635,13 +1620,14 @@ class DocStore(DocStoreInterface):
             value_type = "ndarray"
             value = encode_ndarray(value)
 
-        value_data = {
-            "elem_id": elem_id,
-            "key": key,
-            "type": value_type,
-            "value": value,
-        }
-        result = self._insert_elem(Value, value_data)
+        value_entity = ValueEntity(
+            elem_id=elem_id,
+            key=key,
+            type=value_type,
+            value=value,
+        )
+
+        result = self._insert_elem(Value, value_entity)
         if result is None:
             raise ElementExistsError(f"Value for element {elem_id} and key {key} already exists.")
         return result
@@ -1652,14 +1638,12 @@ class DocStore(DocStoreInterface):
         self._check_writable()
         if not target_id:
             raise ValueError("target_id must be provided.")
-        if not isinstance(task_input, dict):
-            raise ValueError("task_input must be a dictionary.")
-        command = task_input.get("command")
-        if not isinstance(command, str) or not command:
+        if not isinstance(task_input, TaskInput):
+            raise ValueError("task_input must be a TaskInput instance.")
+        command = task_input.command
+        if not command:
             raise ValueError("command must be a non-empty string.")
-        args = task_input.get("args", {})
-        if not isinstance(args, dict):
-            raise ValueError("args must be a dictionary.")
+        args = task_input.args or {}
         if any(not isinstance(k, str) for k in args.keys()):
             raise ValueError("All keys in args must be strings.")
 
@@ -1667,16 +1651,19 @@ class DocStore(DocStoreInterface):
             # command is a handler path.
             command, args["path"] = "handler", command
 
-        task_data = {
-            "target": target_id,
-            "command": command,
-            "args": args,
-            "status": "new",
-            "create_user": self.username,
-            "grab_time": 0,
-        }
+        task_entity = TaskEntity(
+            target=target_id,
+            command=command,
+            args=args,
+            status="new",
+            create_user=self.username,
+            update_user=None,
+            grab_user=None,
+            grab_time=0,
+            error_message=None,
+        )
 
-        result = self._insert_elem(Task, task_data)
+        result = self._insert_elem(Task, task_entity)
         assert result is not None, "Task insertion failed, should not happen."
         return result
 
@@ -1690,45 +1677,70 @@ class DocStore(DocStoreInterface):
     ) -> Layout:
         """Import content blocks and create a layout for a page."""
         self._check_writable()
+        self._check_name("provider", provider)
         if not page_id:
             raise ValueError("page_id must be provided.")
         if not provider:
             raise ValueError("provider must be a non-empty string.")
-
+        if any(not isinstance(block, ContentBlockInput) for block in content_blocks):
+            raise ValueError("Each content_block must be a ContentBlockInput instance.")
         if not self.try_get_page(page_id):
             raise ValueError(f"Page with ID {page_id} does not exist.")
         if not upsert and self.try_get_layout_by_page_id_and_provider(page_id, provider):
             raise ElementExistsError(f"Layout for page {page_id} with provider {provider} already exists.")
 
-        parsed_blocks: list[ContentBlock] = []
-        for block in content_blocks:
-            if not isinstance(block, dict):
-                raise ValueError("Each content_block must be a dict.")
-            parsed_blocks.append(ContentBlock(**block))
-
-        blocks = [
-            {
-                "bbox": b.bbox,
-                "type": b.type,
-                "angle": b.angle,
-                **({"score": b.score} if b.score is not None else {}),
-                **({"tags": b.block_tags} if b.block_tags else {}),
-            }
-            for b in parsed_blocks
+        block_inputs = [
+            BlockInput(
+                type=b.type,
+                bbox=b.bbox,
+                angle=b.angle,
+                # score=b.score,
+                tags=b.block_tags,
+            )
+            for b in content_blocks
         ]
-        inserted_blocks = self._insert_blocks(page_id, blocks)
+        blocks = self._insert_blocks(page_id, block_inputs)
 
-        for c, block in zip(parsed_blocks, inserted_blocks):
-            if c.content is not None:
-                try:
-                    content_input = ContentInput({"content": c.content, "format": c.format or "text"})
-                    if c.content_tags:
-                        content_input["tags"] = c.content_tags
-                    self.insert_content(block["id"], provider, content_input, upsert=upsert)
-                except ElementExistsError:
-                    pass
+        for c, block in zip(content_blocks, blocks):
+            if c.content is None:
+                continue
+            try:
+                content_input = ContentInput(
+                    format=c.format or "text",
+                    content=c.content,
+                    tags=c.content_tags,
+                )
+                self.insert_content(block.id, provider, content_input, upsert=upsert)
+            except ElementExistsError:
+                pass
 
-        return self.insert_layout(page_id, provider, {"blocks": inserted_blocks}, upsert=upsert)
+        # same code with insert_layout
+        layout_entity = LayoutEntity(
+            page_id=page_id,
+            provider=provider,
+            blocks=[
+                LayoutBlockEntity(
+                    id=block.id,
+                    type=block.type,
+                    bbox=block.bbox,
+                    angle=block.angle,
+                )
+                for block in blocks
+            ],
+            relations=[],
+            tags=[],
+        )
+
+        if upsert:
+            query = {"page_id": page_id, "provider": provider}
+            return self._upsert_elem(Layout, query, layout_entity)
+
+        result = self._insert_elem(Layout, layout_entity)
+        if result is None:
+            raise ElementExistsError(
+                f"Layout for page {page_id} with provider {provider} already exists.",
+            )
+        return result
 
     ###################
     # TASK OPERATIONS #

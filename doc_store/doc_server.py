@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from typing import Any, Iterable, Literal
 
 from fastapi import APIRouter, FastAPI, Query, Request, status
@@ -56,9 +57,18 @@ def route(
     return decorator
 
 
-def iter_response(iterable: Iterable[dict]) -> Iterable[bytes]:
+async def add_process_time(request: Request, call_next):
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    process_time = time.perf_counter() - start_time
+    response.headers["x-process-time"] = str(process_time)
+    return response
+
+
+def iter_response(iterable: Iterable[Element]) -> Iterable[bytes]:
     for item in iterable:
-        json_string = json.dumps(item, ensure_ascii=False)
+        item_dict = item.model_dump()
+        json_string = json.dumps(item_dict, ensure_ascii=False)
         yield (json_string + "\n").encode("utf-8")
 
 
@@ -70,8 +80,9 @@ class DocServer(DocStoreInterface):
         self.app = FastAPI(title="DocStore API")
         self.logger = logging.getLogger(__name__)
 
-        # self.app.add_exception_handler(Exception, self.exception_handler)
+        self.app.middleware("http")(add_process_time)
         self.app.middleware("http")(self.exception_middleware)
+        # self.app.add_exception_handler(Exception, self.exception_handler)
 
         self.app.add_middleware(
             CORSMiddleware,
@@ -96,7 +107,6 @@ class DocServer(DocStoreInterface):
                 path=route_info["path"],
                 endpoint=endpoint,
                 methods=[route_info["method"]],
-                response_model=None,
                 tags=route_info["tags"],
             )
 

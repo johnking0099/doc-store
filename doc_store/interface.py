@@ -1,15 +1,14 @@
 import io
 import time
 from abc import ABC, abstractmethod
-from functools import cached_property
-from typing import Any, Callable, Iterable, Literal, NotRequired, TypedDict, TypeVar
+from typing import Any, Callable, Iterable, Literal, TypeVar
 
 from PIL import Image
+from pydantic import BaseModel
 
 from .io import read_file, read_image
 from .pdf_doc import PDFDocument
 from .s3 import head_s3_object, put_s3_object
-from .structs import ANGLE_OPTIONS
 from .utils import BlockingThreadPool, secs_to_readable
 
 #########
@@ -17,71 +16,73 @@ from .utils import BlockingThreadPool, secs_to_readable
 #########
 
 
-class MetricInput(TypedDict):
-    value: int | float
+class InputModel(BaseModel):
+    pass
 
 
-class ValueInput(TypedDict):
+class MetricInput(InputModel):
+    value: float | int
+
+
+class ValueInput(InputModel):
     value: Any
 
 
-class TaskInput(TypedDict):
+class TaskInput(InputModel):
     command: str
-    args: NotRequired[dict[str, Any]]
+    args: dict[str, Any] | None = None
 
 
-class DocInput(TypedDict):
+class DocInput(InputModel):
     pdf_path: str
-    orig_path: NotRequired[str]
-    tags: NotRequired[list[str]]
+    pdf_filename: str | None = None
+    orig_path: str | None = None
+    orig_filename: str | None = None
+    tags: list[str] | None = None
 
 
-class PageInput(TypedDict):
+class PageInput(InputModel):
     image_path: str
-    doc_id: NotRequired[str]
-    page_idx: NotRequired[int]
-    tags: NotRequired[list[str]]
+    image_dpi: int | None = None
+    doc_id: str | None = None
+    page_idx: int | None = None
+    tags: list[str] | None = None
 
 
-class DocPageInput(TypedDict):
+class DocPageInput(InputModel):
     image_path: str
-    tags: NotRequired[list[str]]
+    tags: list[str] | None = None
 
 
-class LayoutInput(TypedDict):
-    blocks: list[dict]
-    relations: NotRequired[list[dict]]
-    tags: NotRequired[list[str]]
-
-
-class BlockInput(TypedDict):
+class BlockInput(InputModel):
     type: str
     bbox: list[float]
-    angle: NotRequired[Literal[None, 0, 90, 180, 270]]
-    tags: NotRequired[list[str]]
+    angle: Literal[None, 0, 90, 180, 270] = None
+    # TODO: score?
+    tags: list[str] | None = None
 
 
-class ContentInput(TypedDict):
+class LayoutInput(InputModel):
+    blocks: list[BlockInput]
+    relations: list[dict] | None = None
+    tags: list[str] | None = None
+
+
+class ContentInput(InputModel):
     format: str
     content: str
-    tags: NotRequired[list[str]]
+    tags: list[str] | None = None
 
 
-class ContentBlockInput(TypedDict):
+class ContentBlockInput(InputModel):
     type: str
     bbox: list[float]
-    angle: NotRequired[Literal[None, 0, 90, 180, 270]]
-    content: NotRequired[str]
-    format: NotRequired[str]
-    score: NotRequired[float]
-    block_tags: NotRequired[list[str]]
-    content_tags: NotRequired[list[str]]
-
-
-class UpdateTaskInput(TypedDict):
-    page_id: str
-    task_id: str
-    status: str
+    angle: Literal[None, 0, 90, 180, 270] = None
+    content: str | None = None
+    format: str | None = None
+    score: float | None = None
+    block_tags: list[str] | None = None
+    content_tags: list[str] | None = None
 
 
 ##########
@@ -89,21 +90,24 @@ class UpdateTaskInput(TypedDict):
 ##########
 
 
-class Element(dict):
+class Element(BaseModel):
     """Base class for all elements."""
 
-    def __init__(self, mapping: dict, store: "DocStoreInterface"):
-        super().__init__(mapping)
-        self._store = store
+    id: str
+    rid: int
+    create_time: int | None = None
+    update_time: int | None = None
+    _store: "DocStoreInterface | None" = None
 
     def __getstate__(self) -> dict:
-        return dict(self)
+        return self.model_dump()
 
     def __setstate__(self, state: dict) -> None:
         if not hasattr(self, "_store"):
             self._store = None
-        self.clear()
-        self.update(state)
+        # TODO: recover object
+        # self.clear()
+        # self.update(state)
 
     @property
     def store(self) -> "DocStoreInterface":
@@ -119,59 +123,34 @@ class Element(dict):
             raise TypeError("store must be an instance of DocStoreInterface.")
         self._store = store
 
-    @cached_property
-    def id(self) -> str:
-        """The unique ID of the element."""
-        id = self.get("id")
-        if not id:
-            raise ValueError("Element does not have an ID.")
-        return id
-
-    @cached_property
-    def rid(self) -> int:
-        """A stable random number (not unique) for the element."""
-        rid = self.get("rid")
-        if isinstance(rid, int):
-            return rid
-        return int(self.id[-8:], 16) & 0x7FFFFFFF
-
 
 class DocElement(Element):
     """Base class for all doc elements."""
 
-    @property
-    def tags(self) -> list[str]:
-        """Get tags of the element."""
-        return self.get("tags") or []
-
-    @property
-    def metrics(self) -> dict:
-        """Get metrics of the element."""
-        return self.get("metrics") or {}
+    tags: list[str] = []
+    metrics: dict = {}
 
     def add_tag(self, tag: str) -> None:
         """Add tag to an element."""
         self.store.add_tag(self.id, tag)
-        # update current instance
         if tag not in self.tags:
-            self["tags"] = self.tags + [tag]
+            self.tags = self.tags + [tag]
 
     def del_tag(self, tag: str) -> None:
         """Delete tag from an element."""
         self.store.del_tag(self.id, tag)
-        # update current instance
         if tag in self.tags:
-            self["tags"] = [t for t in self.tags if t != tag]
+            self.tags = [t for t in self.tags if t != tag]
 
-    def add_metric(self, name: str, value_input: ValueInput) -> None:
+    def add_metric(self, name: str, metric_input: MetricInput) -> None:
         """Add metric to an element."""
-        self.store.add_metric(self.id, name, value_input)
-        self["metrics"] = {**self.metrics, name: value_input.get("value")}
+        self.store.add_metric(self.id, name, metric_input)
+        self.metrics = {**self.metrics, name: metric_input.value}
 
     def del_metric(self, name: str) -> None:
         """Delete metric from an element."""
         self.store.del_metric(self.id, name)
-        self["metrics"] = {k: v for k, v in self.metrics.items() if k != name}
+        self.metrics = {k: v for k, v in self.metrics.items() if k != name}
 
     def try_get_value(self, key: str) -> "Value | None":
         """Try to get a value by key."""
@@ -227,18 +206,20 @@ class DocElement(Element):
 class Doc(DocElement):
     """Doc in the store."""
 
-    @property
-    def pdf(self) -> PDFDocument:
-        """Get the PDF document associated with the doc."""
-        return PDFDocument(self.pdf_bytes)
+    pdf_path: str
+    pdf_filename: str | None = None
+    pdf_filesize: int
+    pdf_hash: str
+    num_pages: int
+    page_width: float
+    page_height: float
+    metadata: dict = {}
 
-    @cached_property
-    def pdf_path(self) -> str:
-        """Get the PDF path of the doc."""
-        pdf_path = self.get("pdf_path")
-        if not pdf_path:
-            raise ValueError("Doc does not have a PDF path.")
-        return pdf_path
+    # Original file info (if exists)
+    orig_path: str | None = None
+    orig_filesize: int | None = None
+    orig_filename: str | None = None
+    orig_hash: str | None = None
 
     @property
     def pdf_bytes(self) -> bytes:
@@ -246,15 +227,15 @@ class Doc(DocElement):
         return read_file(self.pdf_path)
 
     @property
-    def num_pages(self) -> int:
-        """Return the number of pages in the doc."""
-        return self.get("num_pages", 0)
+    def pdf(self) -> PDFDocument:
+        """Get the PDF document associated with the doc."""
+        return PDFDocument(self.pdf_bytes)
 
     @property
     def pages(self) -> list["Page"]:
         """Get all pages of the doc."""
         pages = list(self.find_pages())
-        pages.sort(key=lambda p: p.page_idx)
+        pages.sort(key=lambda p: p.page_idx or 0)
         return pages
 
     def find_pages(
@@ -273,29 +254,37 @@ class Doc(DocElement):
 
     def insert_page(self, page_idx: int, page_input: DocPageInput) -> "Page":
         """Insert a page for the doc, return the inserted page."""
-        return self.store.insert_page({**page_input, "doc_id": self.id, "page_idx": page_idx})
+        return self.store.insert_page(
+            PageInput(
+                image_path=page_input.image_path,
+                doc_id=self.id,
+                page_idx=page_idx,
+                tags=page_input.tags,
+            )
+        )
 
 
 class Page(DocElement):
     """Page of a doc."""
 
-    @property
-    def image(self) -> Image.Image:
-        """Get the image of the page."""
-        return read_image(self.image_path)
-
-    @cached_property
-    def image_path(self) -> str:
-        """Get the image path of the page."""
-        image_path = self.get("image_path")
-        if not image_path:
-            raise ValueError("Page does not have an image path.")
-        return image_path
+    doc_id: str | None = None
+    page_idx: int | None = None
+    image_path: str
+    image_filesize: int
+    image_hash: str
+    image_width: int
+    image_height: int
+    image_dpi: int | None = None
 
     @property
     def image_bytes(self) -> bytes:
         """Get the image bytes of the page."""
         return read_file(self.image_path)
+
+    @property
+    def image(self) -> Image.Image:
+        """Get the image of the page."""
+        return read_image(self.image_path)
 
     @property
     def image_pub_link(self) -> str:
@@ -324,13 +313,7 @@ class Page(DocElement):
     @property
     def doc(self) -> Doc | None:
         """Get the doc associated with the page."""
-        doc_id = self.get("doc_id")
-        return self.store.get_doc(doc_id) if doc_id else None
-
-    @property
-    def page_idx(self) -> int:
-        """Get the page index of the page."""
-        return self.get("page_idx", 0)
+        return self.store.get_doc(self.doc_id) if self.doc_id else None
 
     def try_get_layout(self, provider: str) -> "Layout | None":
         """Try to get the layout of the page by provider."""
@@ -416,13 +399,7 @@ class Page(DocElement):
 class PageElement(DocElement):
     """Base class for elements that are associated with a page."""
 
-    @cached_property
-    def page_id(self) -> str:
-        """Page ID associated with this element."""
-        page_id = self.get("page_id")
-        if not page_id:
-            raise ValueError("Element does not have a page ID.")
-        return page_id
+    page_id: str
 
     @property
     def page(self) -> Page:
@@ -433,18 +410,9 @@ class PageElement(DocElement):
 class Layout(PageElement):
     """Layout of a page, containing blocks and relations."""
 
-    @cached_property
-    def provider(self) -> str:
-        """Provider of the layout."""
-        provider = self.get("provider")
-        if not provider:
-            raise ValueError("Layout does not have a provider.")
-        return provider
-
-    @cached_property
-    def blocks(self) -> list["Block"]:
-        """Get all blocks of the layout."""
-        return self.get("blocks") or []
+    provider: str
+    blocks: list["Block"]
+    relations: list[dict] = []
 
     def list_versions(self) -> list[str]:
         """List all content versions of the layout."""
@@ -455,7 +423,7 @@ class Layout(PageElement):
         versions = set()
         query = {"block_id": {"$in": block_ids}}
         for content in self.store.find_contents(query=query):
-            versions.add(content["version"])
+            versions.add(content.version)
         return sorted(versions)
 
     def list_contents(self, version: str) -> list["Content"]:
@@ -474,29 +442,9 @@ class Layout(PageElement):
 class Block(PageElement):
     """Block of a page, representing a specific area with a type."""
 
-    @cached_property
-    def type(self) -> str:
-        """Type of the block."""
-        block_type = self.get("type")
-        if not block_type:
-            raise ValueError("Block does not have a type.")
-        return block_type
-
-    @cached_property
-    def bbox(self) -> list[float]:
-        """Bounding box of the block."""
-        bbox = self.get("bbox")
-        if not bbox:
-            raise ValueError("Block does not have a bounding box.")
-        return bbox
-
-    @cached_property
-    def angle(self) -> Literal[None, 0, 90, 180, 270]:
-        """Get the angle of the block."""
-        angle = self.get("angle")
-        if angle not in ANGLE_OPTIONS:
-            raise ValueError(f"Invalid angle: {angle}. Must be one of {ANGLE_OPTIONS}.")
-        return angle
+    type: str
+    bbox: list[float]
+    angle: Literal[None, 0, 90, 180, 270] = None
 
     @property
     def image(self) -> Image.Image:
@@ -569,93 +517,39 @@ class Block(PageElement):
 class Content(PageElement):
     """Content of a block, representing the text or data within a block."""
 
-    @cached_property
-    def block_id(self) -> str:
-        """Block ID associated with this content."""
-        block_id = self.get("block_id")
-        if not block_id:
-            raise ValueError("Content does not have a block ID.")
-        return block_id
+    block_id: str
+    version: str
+    format: str
+    content: str
 
     @property
     def block(self) -> Block:
         """Get the block associated with this content."""
         return self.store.get_block(self.block_id)
 
-    @cached_property
-    def version(self) -> str:
-        """Version of the content."""
-        version = self.get("version")
-        if not version:
-            raise ValueError("Content does not have a version.")
-        return version
-
 
 class Value(Element):
-    @property
-    def elem_id(self) -> str:
-        """Get the elem_id of the value."""
-        elem_id = self.get("elem_id")
-        if not elem_id:
-            raise ValueError("Value does not have a elem_id.")
-        return elem_id
+    elem_id: str
+    key: str
+    type: str
+    value: Any
 
     @property
-    def key(self) -> str:
-        """Get the key of the value."""
-        key = self.get("key")
-        if not key:
-            raise ValueError("Value does not have a key.")
-        return key
-
-    @property
-    def type(self) -> str | None:
-        """Get the type of the value."""
-        return self.get("type")
-
-    @property
-    def value(self) -> Any | None:
-        """Get the value."""
-        return self.get("value")
+    def elem(self) -> DocElement:
+        """Get the element associated with this value."""
+        return self.store.get(self.elem_id)
 
 
 class Task(Element):
-    @property
-    def target(self) -> str:
-        """Get the target of the task."""
-        target = self.get("target")
-        if not target:
-            raise ValueError("Task does not have a target.")
-        return target
-
-    @property
-    def command(self) -> str:
-        """Get the command of the task."""
-        command = self.get("command")
-        if not command:
-            raise ValueError("Task does not have a command.")
-        return command
-
-    @property
-    def args(self) -> dict[str, Any]:
-        """Get the arguments of the task."""
-        return self.get("args") or {}
-
-    @property
-    def status(self) -> str:
-        """Get the status of the task."""
-        status = self.get("status")
-        if not status:
-            raise ValueError("Task does not have a status.")
-        return status
-
-    @property
-    def grab_time(self) -> int:
-        """Get the grab time of the task."""
-        grab_time = self.get("grab_time")
-        if grab_time is None:
-            raise ValueError("Task does not have a grab time.")
-        return grab_time
+    target: str  # TODO: change
+    command: str
+    args: dict[str, Any] = {}
+    status: str
+    create_user: str
+    update_user: str | None = None
+    grab_user: str | None = None
+    grab_time: int = 0
+    error_message: str | None = None
 
 
 class ElementNotFoundError(Exception):
