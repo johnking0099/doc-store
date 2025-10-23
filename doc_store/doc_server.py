@@ -3,7 +3,7 @@ import logging
 import time
 from typing import Any, Iterable, Literal
 
-from fastapi import APIRouter, FastAPI, Query, Request, status
+from fastapi import APIRouter, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -32,6 +32,7 @@ from .interface import (
     ValueInput,
 )
 
+DEFAULT_LIMIT = 10
 INJECT: Any = None
 _global_index = 0
 
@@ -239,10 +240,16 @@ class DocServer(DocStoreInterface):
     def list_docs(
         self,
         query: dict | None = None,
-        skip: int = Query(default=0, ge=0),
-        limit: int = Query(default=10, ge=1, le=1000),
+        skip: int | None = None,
+        limit: int | None = None,
         req: Request = INJECT,
     ) -> list[Doc]:
+        if skip is not None:
+            skip = max(0, skip)
+        if limit is not None:
+            limit = max(1, limit)
+        else:  # limit is None
+            limit = DEFAULT_LIMIT
         it = self.get_store(req).find_docs(query, skip=skip, limit=limit)
         return list(it)
 
@@ -251,10 +258,16 @@ class DocServer(DocStoreInterface):
         self,
         query: dict | None = None,
         doc_id: str | None = None,
-        skip: int = Query(default=0, ge=0),
-        limit: int = Query(default=10, ge=1, le=1000),
+        skip: int | None = None,
+        limit: int | None = None,
         req: Request = INJECT,
     ) -> list[Page]:
+        if skip is not None:
+            skip = max(0, skip)
+        if limit is not None:
+            limit = max(1, limit)
+        elif not doc_id:
+            limit = DEFAULT_LIMIT
         it = self.get_store(req).find_pages(query, doc_id, skip=skip, limit=limit)
         return list(it)
 
@@ -263,10 +276,16 @@ class DocServer(DocStoreInterface):
         self,
         query: dict | None = None,
         page_id: str | None = None,
-        skip: int = Query(default=0, ge=0),
-        limit: int = Query(default=10, ge=1, le=1000),
+        skip: int | None = None,
+        limit: int | None = None,
         req: Request = INJECT,
     ) -> list[Layout]:
+        if skip is not None:
+            skip = max(0, skip)
+        if limit is not None:
+            limit = max(1, limit)
+        elif not page_id:
+            limit = DEFAULT_LIMIT
         it = self.get_store(req).find_layouts(query, page_id, skip=skip, limit=limit)
         return list(it)
 
@@ -279,6 +298,12 @@ class DocServer(DocStoreInterface):
         limit: int | None = None,
         req: Request = INJECT,
     ) -> list[Block]:
+        if skip is not None:
+            skip = max(0, skip)
+        if limit is not None:
+            limit = max(1, limit)
+        elif not page_id:
+            limit = DEFAULT_LIMIT
         it = self.get_store(req).find_blocks(query, page_id, skip=skip, limit=limit)
         return list(it)
 
@@ -288,10 +313,16 @@ class DocServer(DocStoreInterface):
         query: dict | None = None,
         page_id: str | None = None,
         block_id: str | None = None,
-        skip: int = Query(default=0, ge=0),
-        limit: int = Query(default=10, ge=1, le=1000),
+        skip: int | None = None,
+        limit: int | None = None,
         req: Request = INJECT,
     ) -> list[Content]:
+        if skip is not None:
+            skip = max(0, skip)
+        if limit is not None:
+            limit = max(1, limit)
+        elif not (page_id or block_id):
+            limit = DEFAULT_LIMIT
         it = self.get_store(req).find_contents(query, page_id, block_id, skip=skip, limit=limit)
         return list(it)
 
@@ -301,10 +332,16 @@ class DocServer(DocStoreInterface):
         query: dict | None = None,
         elem_id: str | None = None,
         key: str | None = None,
-        skip: int = Query(default=0, ge=0),
-        limit: int = Query(default=10, ge=1, le=1000),
+        skip: int | None = None,
+        limit: int | None = None,
         req: Request = INJECT,
     ) -> list[Value]:
+        if skip is not None:
+            skip = max(0, skip)
+        if limit is not None:
+            limit = max(1, limit)
+        elif not elem_id:
+            limit = DEFAULT_LIMIT
         it = self.get_store(req).find_values(query, elem_id, key, skip=skip, limit=limit)
         return list(it)
 
@@ -316,10 +353,16 @@ class DocServer(DocStoreInterface):
         command: str | None = None,
         status: str | None = None,
         create_user: str | None = None,
-        skip: int = Query(default=0, ge=0),
-        limit: int = Query(default=10, ge=1, le=1000),
+        skip: int | None = None,
+        limit: int | None = None,
         req: Request = INJECT,
     ) -> list[Task]:
+        if skip is not None:
+            skip = max(0, skip)
+        if limit is not None:
+            limit = max(1, limit)
+        elif not target:
+            limit = DEFAULT_LIMIT
         it = self.get_store(req).find_tasks(query, target, command, status, create_user, skip=skip, limit=limit)
         return list(it)
 
