@@ -424,7 +424,7 @@ class DocServer(DocStoreInterface):
         return self.get_store(req).grab_new_tasks(command, args, create_user, num, hold_sec)
 
     @route("POST", "/update-grabbed-task/{task_id}", tags=["tasks"])
-    def update_grabbed_task(
+    def update_task(
         self,
         task_id: str,
         grab_time: int,
@@ -432,7 +432,7 @@ class DocServer(DocStoreInterface):
         error_message: str | None = None,
         req: Request = INJECT,
     ):
-        return self.get_store(req).update_grabbed_task(task_id, grab_time, status, error_message)
+        return self.get_store(req).update_task(task_id, grab_time, status, error_message)
 
 
 def main():

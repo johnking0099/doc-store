@@ -51,6 +51,7 @@ class PageInput(InputModel):
 
 class DocPageInput(InputModel):
     image_path: str
+    image_dpi: int | None = None
     tags: list[str] | None = None
 
 
@@ -83,6 +84,11 @@ class ContentBlockInput(InputModel):
     score: float | None = None
     block_tags: list[str] | None = None
     content_tags: list[str] | None = None
+
+
+class GrabbedTaskInput(InputModel):
+    id: str
+    grab_time: int
 
 
 ##########
@@ -257,6 +263,7 @@ class Doc(DocElement):
         return self.store.insert_page(
             PageInput(
                 image_path=page_input.image_path,
+                image_dpi=page_input.image_dpi,
                 doc_id=self.id,
                 page_idx=page_idx,
                 tags=page_input.tags,
@@ -540,7 +547,7 @@ class Value(Element):
         return self.store.get(self.elem_id)
 
 
-class Task(Element):
+class Task(GrabbedTaskInput, Element):
     target: str  # TODO: change
     command: str
     args: dict[str, Any] = {}
@@ -851,6 +858,20 @@ class DocStoreInterface(ABC):
         )
         return grabbed_tasks[0] if grabbed_tasks else None
 
+    def update_grabbed_task(
+        self,
+        task: GrabbedTaskInput,
+        status: Literal["done", "error", "skipped"],
+        error_message: str | None = None,
+    ):
+        """Update a task after processing."""
+        return self.update_task(
+            task_id=task.id,
+            grab_time=task.grab_time,
+            status=status,
+            error_message=error_message,
+        )
+
     def iterate(
         self,
         elem_type: type[T],
@@ -1100,7 +1121,7 @@ class DocStoreInterface(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    def update_grabbed_task(
+    def update_task(
         self,
         task_id: str,
         grab_time: int,

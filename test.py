@@ -519,5 +519,5 @@ print(tasks)
 print("# Update Task")
 
 for task in tasks:
-    store.update_grabbed_task(task.id, task.grab_time, "done")
+    store.update_grabbed_task(task, "done")
     print(f" - Updated task {task.id} to done")

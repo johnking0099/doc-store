@@ -446,7 +446,7 @@ class DocClient(DocStoreInterface):
         data = self._post(f"/grab-new-tasks/{command}", json_data=args, params=params)
         return [self._parse_elem(Task, task_data) for task_data in data]
 
-    def update_grabbed_task(
+    def update_task(
         self,
         task_id: str,
         grab_time: int,

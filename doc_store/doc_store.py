@@ -1815,7 +1815,7 @@ class DocStore(DocStoreInterface):
         return grabbed_tasks
 
     @_measure_time
-    def update_grabbed_task(
+    def update_task(
         self,
         task_id: str,
         grab_time: int,
