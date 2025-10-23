@@ -794,7 +794,6 @@ class DocStore(DocStoreInterface):
             blocks = elem_data.get("blocks") or []
             for block_data in blocks:
                 block_data["page_id"] = page_id
-                print(block_data)
             elem_data["blocks"] = [self._parse_elem(Block, b) for b in blocks]
         elif elem_type == Content:
             elem_data["format"] = elem_data.get("format", "text")

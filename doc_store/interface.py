@@ -106,14 +106,12 @@ class Element(BaseModel):
     _store: "DocStoreInterface | None" = None
 
     def __getstate__(self) -> dict:
-        return self.model_dump()
+        state = self.__dict__.copy()
+        state.pop("_store", None)
+        return state
 
     def __setstate__(self, state: dict) -> None:
-        if not hasattr(self, "_store"):
-            self._store = None
-        # TODO: recover object
-        # self.clear()
-        # self.update(state)
+        self.__dict__.update(state)
 
     @property
     def store(self) -> "DocStoreInterface":
