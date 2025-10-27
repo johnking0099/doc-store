@@ -786,6 +786,10 @@ class DocStore(DocStoreInterface):
         if elem_data.get("rid") is None:
             elem_id = elem_data.get("id") or "0"
             elem_data["rid"] = int(elem_id[-8:], 16) & 0x7FFFFFFF
+        if elem_data.get("tags") is None:
+            elem_data["tags"] = []
+        if elem_data.get("metrics") is None:
+            elem_data["metrics"] = {}
 
         if elem_type == Block:
             elem_data = self._parse_block(elem_data)
