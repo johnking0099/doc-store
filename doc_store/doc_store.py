@@ -1807,15 +1807,84 @@ class DocStore(DocStoreInterface):
         create_user: str | None = None,
         num=10,
         hold_sec=3600,
+        max_retries=10,
     ) -> list[Task]:
-        """Grab new tasks for processing."""
-        grabbed_tasks = []
-        for _ in range(num):
-            task = self.grab_new_task(command, args, create_user, hold_sec)
-            if task is None:
+        """Grab new tasks for processing. Using batch update with retry."""
+        if not isinstance(command, str) or not command:
+            raise ValueError("command must be a non-empty string.")
+        if hold_sec < 30:
+            raise ValueError("hold_sec must be at least 30 seconds.")
+        if any(not isinstance(k, str) for k in args.keys()):
+            raise ValueError("All keys in args must be strings.")
+
+        base_query = {
+            "command": command,
+            "status": "new",
+        }
+        for key, value in args.items():
+            base_query[f"args.{key}"] = value
+        
+        if create_user is not None:
+            if not isinstance(create_user, str) or not create_user:
+                raise ValueError("create_user must be a non-empty string.")
+            base_query["create_user"] = create_user
+        
+        all_grabbed_tasks = []
+        remaining = num
+        retry_count = 0
+        has_more_tasks = True
+        
+        while has_more_tasks and remaining > 0 and retry_count < max_retries:
+            retry_count += 1
+            
+            server_time_result = self.coll_tasks.aggregate([
+                {"$limit": 1},
+                {"$project": {"now": {"$toLong": "$$NOW"}}}
+            ])
+            server_time_ms = next(server_time_result)["now"]
+            cutoff_time = server_time_ms - hold_sec * 1000
+            
+            query = {
+                **base_query,
+                "grab_time": {"$lt": cutoff_time},
+            }
+            
+            candidate_tasks = list(
+                self.coll_tasks.find(filter=query, projection={"id": 1}).limit(remaining)
+            )
+            
+            if not candidate_tasks:
                 break
-            grabbed_tasks.append(task)
-        return grabbed_tasks
+            
+            task_ids = [task["id"] for task in candidate_tasks]
+            has_more_tasks = len(task_ids) == remaining
+
+            grab_id = str(uuid.uuid4())
+            self.coll_tasks.update_many(
+                {
+                    **query,
+                    "id": {"$in": task_ids},
+                },
+                [
+                    {
+                        "$set": {
+                            "grab_time": {"$toLong": "$$NOW"},
+                            "grab_user": self.username,
+                            "grab_id": grab_id,
+                        }
+                    }
+                ],
+            )
+            updated_tasks = self.coll_tasks.find({"grab_id": grab_id})
+            
+            batch_grabbed = []
+            for task_data in updated_tasks:
+                batch_grabbed.append(self._parse_elem(Task, task_data))
+                
+            all_grabbed_tasks.extend(batch_grabbed)
+            remaining -= len(batch_grabbed)
+        
+        return all_grabbed_tasks
 
     @_measure_time
     def update_task(
