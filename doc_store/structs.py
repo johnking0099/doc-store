@@ -20,16 +20,23 @@ class BlockType:
     PAGE_NUMBER = "page_number"  # 页码
     PAGE_FOOTNOTE = "page_footnote"  # 脚注
     ASIDE_TEXT = "aside_text"  # 侧栏文本(装订线等)
-    EQUATION = "equation"  # 公式(独立或行内)
-    EQUATION_BLOCK = "equation_block"  # 公式块(多行公式)
+    EQUATION = "equation"  # 公式(行间公式/独立公式，早期部分行内公式也采用了该类型)
+    EQUATION_INLINE = "equation_inline"  # 行内公式
     EQUATION_NUMBER = "equation_number"  # 公式编号
     REF_TEXT = "ref_text"  # 参考文献(一条)
-    REF_BLOCK = "ref_block"  # 参考文献(大块)
-    LIST = "list"  # 列表块(无序/有序列表)
     LIST_ITEM = "list_item"  # 列表项(无序/有序列表)
     MOLECULAR = "molecular"  # 化学分子结构
     REACTION = "reaction"  # 化学反应
     PHONETIC = "phonetic"  # 注音符号
+    HEADER_IMAGE = "header_image"
+    FOOTER_IMAGE = "footer_image"
+    VERTICAL_TEXT = "vertical_text"
+
+    # containers
+    LIST = "list"  # 列表块(无序/有序列表)
+    REF_BLOCK = "ref_block"  # 参考文献(大块)
+    EQUATION_BLOCK = "equation_block"  # 公式块(多行公式)
+    IMAGE_BLOCK = "image_block"  # 图像块(多图)
 
     # captions
     COMMON_CAPTION = "common_caption"  # 通用标题(table/image/chart)
@@ -90,6 +97,11 @@ BLOCK_TYPES = set(
         BlockType.REACTION,
         BlockType.UNKNOWN,
         BlockType.PHONETIC,
+        BlockType.HEADER_IMAGE,
+        BlockType.FOOTER_IMAGE,
+        BlockType.IMAGE_BLOCK,
+        BlockType.EQUATION_INLINE,
+        BlockType.VERTICAL_TEXT,
     ]
 )
 
