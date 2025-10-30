@@ -1832,15 +1832,16 @@ class DocStore(DocStoreInterface):
         all_grabbed_tasks = []
         remaining = num
         retry_count = 0
+        has_more_tasks = True
         
-        while remaining > 0 and retry_count < max_retries:
+        while has_more_tasks and remaining > 0 and retry_count < max_retries:
             retry_count += 1
             
             server_time_result = self.coll_tasks.aggregate([
                 {"$limit": 1},
                 {"$project": {"now": {"$toLong": "$$NOW"}}}
             ])
-            server_time_ms = next(server_time_result, {}).get("now", int(time.time() * 1000))
+            server_time_ms = next(server_time_result)["now"]
             cutoff_time = server_time_ms - hold_sec * 1000
             
             query = {
@@ -1856,6 +1857,8 @@ class DocStore(DocStoreInterface):
                 break
             
             task_ids = [task["id"] for task in candidate_tasks]
+            has_more_tasks = len(task_ids) == remaining
+
             grab_id = str(uuid.uuid4())
             self.coll_tasks.update_many(
                 {
@@ -1880,9 +1883,6 @@ class DocStore(DocStoreInterface):
                 
             all_grabbed_tasks.extend(batch_grabbed)
             remaining -= len(batch_grabbed)
-
-            if retry_count == 1 and len(task_ids) < num:
-                break
         
         return all_grabbed_tasks
 
