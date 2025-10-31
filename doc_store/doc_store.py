@@ -317,6 +317,7 @@ def _get_tasks_coll(db: Database):
     #
     #   "grab_user": "worker-1",  # the worker who grabbed the task
     #   "grab_time": 1749031069945,  # when the task was grabbed by a worker
+    #   "grab_id": "dc99b06d-aeb2-4159-a4b9-a2bcf3c26b9b",  # unique id for the grab action
     # }
     coll_tasks = db.get_collection("tasks")
     coll_tasks.create_index([("id", 1)], unique=True)
@@ -324,6 +325,7 @@ def _get_tasks_coll(db: Database):
     coll_tasks.create_index([("status", 1)])
     coll_tasks.create_index([("command", 1), ("status", 1), ("grab_time", 1)])
     coll_tasks.create_index([("create_user", 1)])
+    coll_tasks.create_index([("grab_id", 1)])
     return coll_tasks
 
 
@@ -1817,56 +1819,43 @@ class DocStore(DocStoreInterface):
         if any(not isinstance(k, str) for k in args.keys()):
             raise ValueError("All keys in args must be strings.")
 
-        base_query = {
-            "command": command,
-            "status": "new",
-        }
+        base_query = {"command": command, "status": "new"}
         for key, value in args.items():
             base_query[f"args.{key}"] = value
-        
+
         if create_user is not None:
             if not isinstance(create_user, str) or not create_user:
                 raise ValueError("create_user must be a non-empty string.")
             base_query["create_user"] = create_user
-        
-        all_grabbed_tasks = []
-        remaining = num
+
+        server_time_query = [{"$limit": 1}, {"$project": {"now": {"$toLong": "$$NOW"}}}]
+        grabbed_tasks = []
         retry_count = 0
         has_more_tasks = True
-        
-        while has_more_tasks and remaining > 0 and retry_count < max_retries:
-            retry_count += 1
-            
-            server_time_result = self.coll_tasks.aggregate([
-                {"$limit": 1},
-                {"$project": {"now": {"$toLong": "$$NOW"}}}
-            ])
-            server_time_ms = next(server_time_result)["now"]
-            cutoff_time = server_time_ms - hold_sec * 1000
-            
-            query = {
-                **base_query,
-                "grab_time": {"$lt": cutoff_time},
-            }
-            
-            candidate_tasks = list(
-                self.coll_tasks.find(filter=query, projection={"id": 1}).limit(remaining*10)
-            )
-            
-            if not candidate_tasks:
+
+        while len(grabbed_tasks) < num and retry_count <= max_retries and has_more_tasks:
+            server_time_result = list(self.coll_tasks.aggregate(server_time_query))
+            if not server_time_result:
                 break
-            
-            task_ids = [task["id"] for task in candidate_tasks]
-            has_more_tasks = len(task_ids) >= remaining
-            random.shuffle(task_ids)
-            task_ids = task_ids[:remaining]
+
+            server_time_ms = server_time_result[0]["now"]
+            cutoff_time = server_time_ms - hold_sec * 1000
+
+            limit = num - len(grabbed_tasks)
+            query = {**base_query, "grab_time": {"$lt": cutoff_time}}
+            tasks = list(self.coll_tasks.find(filter=query, projection={"id": 1}).limit(limit*10))
+            random.shuffle(tasks)
+            tasks = tasks[:limit]
+
+            task_ids = [task["id"] for task in tasks]
+            has_more_tasks = len(task_ids) == limit
+
+            if not task_ids:
+                break
 
             grab_id = str(uuid.uuid4())
             self.coll_tasks.update_many(
-                {
-                    **query,
-                    "id": {"$in": task_ids},
-                },
+                {**query, "id": {"$in": task_ids}},
                 [
                     {
                         "$set": {
@@ -1877,16 +1866,12 @@ class DocStore(DocStoreInterface):
                     }
                 ],
             )
-            updated_tasks = self.coll_tasks.find({"grab_id": grab_id})
-            
-            batch_grabbed = []
-            for task_data in updated_tasks:
-                batch_grabbed.append(self._parse_elem(Task, task_data))
-                
-            all_grabbed_tasks.extend(batch_grabbed)
-            remaining -= len(batch_grabbed)
-        
-        return all_grabbed_tasks
+            updated_tasks = list(self.coll_tasks.find({"grab_id": grab_id}))
+            updated_tasks = [self._parse_elem(Task, t) for t in updated_tasks]
+            grabbed_tasks.extend(updated_tasks)
+            retry_count += 1
+
+        return grabbed_tasks
 
     @_measure_time
     def update_task(
