@@ -1828,13 +1828,17 @@ class DocStore(DocStoreInterface):
                 raise ValueError("create_user must be a non-empty string.")
             base_query["create_user"] = create_user
 
+        server_time_query = [{"$limit": 1}, {"$project": {"now": {"$toLong": "$$NOW"}}}]
         grabbed_tasks = []
         retry_count = 0
         has_more_tasks = True
 
         while len(grabbed_tasks) < num and retry_count <= max_retries and has_more_tasks:
-            server_time_result = self.coll_tasks.aggregate([{"$limit": 1}, {"$project": {"now": {"$toLong": "$$NOW"}}}])
-            server_time_ms = next(server_time_result)["now"]
+            server_time_result = list(self.coll_tasks.aggregate(server_time_query))
+            if not server_time_result:
+                break
+
+            server_time_ms = server_time_result[0]["now"]
             cutoff_time = server_time_ms - hold_sec * 1000
 
             limit = num - len(grabbed_tasks)
