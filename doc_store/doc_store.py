@@ -1850,14 +1850,16 @@ class DocStore(DocStoreInterface):
             }
             
             candidate_tasks = list(
-                self.coll_tasks.find(filter=query, projection={"id": 1}).limit(remaining)
+                self.coll_tasks.find(filter=query, projection={"id": 1}).limit(remaining*10)
             )
             
             if not candidate_tasks:
                 break
             
             task_ids = [task["id"] for task in candidate_tasks]
-            has_more_tasks = len(task_ids) == remaining
+            has_more_tasks = len(task_ids) >= remaining
+            random.shuffle(task_ids)
+            task_ids = task_ids[:remaining]
 
             grab_id = str(uuid.uuid4())
             self.coll_tasks.update_many(
