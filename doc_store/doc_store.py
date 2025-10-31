@@ -1843,7 +1843,7 @@ class DocStore(DocStoreInterface):
 
             limit = num - len(grabbed_tasks)
             query = {**base_query, "grab_time": {"$lt": cutoff_time}}
-            tasks = list(self.coll_tasks.find(filter=query, projection={"id": 1}).limit(limit*10))
+            tasks = list(self.coll_tasks.find(filter=query, projection={"id": 1}).limit(limit * 10))
             random.shuffle(tasks)
             tasks = tasks[:limit]
 
