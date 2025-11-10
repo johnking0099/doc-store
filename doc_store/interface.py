@@ -20,6 +20,10 @@ class InputModel(BaseModel):
     pass
 
 
+class AttrInput(InputModel):
+    value: str | list[str] | bool
+
+
 class MetricInput(InputModel):
     value: float | int
 
@@ -91,12 +95,52 @@ class GrabbedTaskInput(InputModel):
     grab_time: int
 
 
+# class MaskBlock(BaseModel):
+#     type: str
+#     bbox: list[float]
+#     angle: Literal[None, 0, 90, 180, 270] = None
+#     attrs: dict[str, Any] = {}
+
+
+# class LabelBlock(BaseModel):
+#     type: str
+#     bbox: list[float]
+#     angle: Literal[None, 0, 90, 180, 270] = None
+#     content: str | None = None
+#     format: str | None = None
+#     attrs: dict[str, Any] = {}
+#     tags: list[str] = []
+
+
 ##########
 # Output #
 ##########
 
 
-class Element(BaseModel):
+class DictModel(BaseModel):
+    def keys(self):
+        return self.__dict__.keys()
+
+    def values(self):
+        return self.__dict__.values()
+
+    def items(self):
+        return self.__dict__.items()
+
+    def get(self, key: str, default: Any | None = None):
+        return self.__dict__.get(key, default)
+
+    def __len__(self) -> int:
+        return len(self.__dict__)
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        setattr(self, key, value)
+
+
+class Element(DictModel):
     """Base class for all elements."""
 
     id: str
@@ -132,7 +176,8 @@ class DocElement(Element):
     """Base class for all doc elements."""
 
     tags: list[str] = []
-    metrics: dict = {}
+    attrs: dict[str, str | list[str] | bool] = {}
+    metrics: dict[str, float | int] = {}
 
     def add_tag(self, tag: str) -> None:
         """Add tag to an element."""
@@ -145,6 +190,16 @@ class DocElement(Element):
         self.store.del_tag(self.id, tag)
         if tag in self.tags:
             self.tags = [t for t in self.tags if t != tag]
+
+    def add_attr(self, name: str, attr_input: AttrInput) -> None:
+        """Add attribute to an element."""
+        self.store.add_attr(self.id, name, attr_input)
+        self.attrs = {**self.attrs, name: attr_input.value}
+
+    def del_attr(self, name: str) -> None:
+        """Delete attribute from an element."""
+        self.store.del_attr(self.id, name)
+        self.attrs = {k: v for k, v in self.attrs.items() if k != name}
 
     def add_metric(self, name: str, metric_input: MetricInput) -> None:
         """Add metric to an element."""
@@ -555,6 +610,69 @@ class Task(GrabbedTaskInput, Element):
     grab_user: str | None = None
     grab_time: int = 0
     error_message: str | None = None
+
+
+# class Label(DocElement):
+#     target_id: str
+#     target_type: Literal["page", "block"]
+#     provider: str
+#     blocks: list[LabelBlock]
+#     masks: list[MaskBlock] = []
+#     relations: list[dict] = []
+#     attrs: dict[str, Any] = {}
+
+
+class User(DictModel):
+    name: str
+    aliases: list[str] = []
+    restricted: bool = False
+
+
+class UserInput(InputModel):
+    name: str
+    aliases: list[str] = []
+    restricted: bool = False
+
+
+class UserUpdate(InputModel):
+    aliases: list[str] | None = None
+    restricted: bool | None = None
+
+
+class KnownOption(DictModel):
+    name: str
+    display_name: str
+    description: str
+
+
+class KnownOptionInput(InputModel):
+    display_name: str = ""
+    description: str = ""
+
+
+class KnownName(DictModel):
+    "Definition of tag/attribute/metric name."
+    name: str
+    display_name: str = ""
+    description: str = ""
+    type: Literal["tag", "attr", "metric"] = "tag"
+    value_type: Literal["null", "int", "float", "str", "list_str", "bool"] = "null"
+    options: list[KnownOption] = []
+    disabled: bool = False
+
+
+class KnownNameInput(InputModel):
+    name: str
+    display_name: str = ""
+    description: str = ""
+    type: Literal["tag", "attr", "metric"] = "tag"
+    value_type: Literal["null", "int", "float", "str", "list_str", "bool"] = "null"
+
+
+class KnownNameUpdate(InputModel):
+    display_name: str | None = None
+    description: str | None = None
+    disabled: bool | None = None
 
 
 class ElementNotFoundError(Exception):
@@ -1042,6 +1160,16 @@ class DocStoreInterface(ABC):
         raise NotImplementedError()
 
     @abstractmethod
+    def add_attr(self, elem_id: str, name: str, attr_input: AttrInput) -> None:
+        """Add an attribute to an element."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def del_attr(self, elem_id: str, name: str) -> None:
+        """Delete an attribute from an element."""
+        raise NotImplementedError()
+
+    @abstractmethod
     def add_metric(self, elem_id: str, name: str, metric_input: MetricInput) -> None:
         """Add a metric to an element."""
         raise NotImplementedError()
@@ -1128,3 +1256,59 @@ class DocStoreInterface(ABC):
     ):
         """Update a task after processing."""
         raise NotImplementedError()
+
+    #########################
+    # MANAGEMENT OPERATIONS #
+    #########################
+
+    @abstractmethod
+    def list_users(self) -> list[User]:
+        """List all users in the system."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def insert_user(self, user_input: UserInput) -> User:
+        """Add a new user to the system."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def update_user(self, name: str, user_update: UserUpdate) -> User:
+        """Update an existing user in the system."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def list_known_names(self) -> list[KnownName]:
+        """List all known tag/attribute/metric names in the system."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def insert_known_name(self, known_name_input: KnownNameInput) -> KnownName:
+        """Add a new known tag/attribute/metric name to the system."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def update_known_name(self, name: str, known_name_update: KnownNameUpdate) -> KnownName:
+        """Update an existing known tag/attribute/metric name in the system."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def add_known_option(self, attr_name: str, option_name: str, option_input: KnownOptionInput) -> None:
+        """Add/Update a new known option to a known attribute name."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def del_known_option(self, attr_name: str, option_name: str) -> None:
+        """Delete a known option from a known attribute name."""
+        raise NotImplementedError()
+
+    # @abstractmethod
+    # def list_task_shortcuts(self):
+    #     raise NotImplementedError()
+
+    # @abstractmethod
+    # def insert_task_shortcut(self):
+    #     raise NotImplementedError()
+
+    # @abstractmethod
+    # def update_task_shortcut(self):
+    #     raise NotImplementedError()

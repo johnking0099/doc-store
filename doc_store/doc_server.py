@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .doc_store import DocStore
 from .interface import (
+    AttrInput,
     Block,
     BlockInput,
     Content,
@@ -21,6 +22,10 @@ from .interface import (
     ElementExistsError,
     ElementNotFoundError,
     ElemType,
+    KnownName,
+    KnownNameInput,
+    KnownNameUpdate,
+    KnownOptionInput,
     Layout,
     LayoutInput,
     MetricInput,
@@ -28,6 +33,9 @@ from .interface import (
     PageInput,
     Task,
     TaskInput,
+    User,
+    UserInput,
+    UserUpdate,
     Value,
     ValueInput,
 )
@@ -383,19 +391,27 @@ class DocServer(DocStoreInterface):
 
     @route("PUT", "/elements/{elem_id}/tags/{tag}", tags=["tags"])
     def add_tag(self, elem_id: str, tag: str, req: Request = INJECT) -> None:
-        self.get_store(req).add_tag(elem_id, tag)
+        return self.get_store(req).add_tag(elem_id, tag)
 
     @route("DELETE", "/elements/{elem_id}/tags/{tag}", tags=["tags"])
     def del_tag(self, elem_id: str, tag: str, req: Request = INJECT) -> None:
-        self.get_store(req).del_tag(elem_id, tag)
+        return self.get_store(req).del_tag(elem_id, tag)
 
-    @route("PUT", "/elements/{elem_id}/metrics/{name}", tags=["metrics"])
+    @route("PUT", "/elements/{elem_id}/attrs/{name}", tags=["tags"])
+    def add_attr(self, elem_id: str, name: str, attr_input: AttrInput, req: Request = INJECT) -> None:
+        return self.get_store(req).add_attr(elem_id, name, attr_input)
+
+    @route("DELETE", "/elements/{elem_id}/attrs/{name}", tags=["tags"])
+    def del_attr(self, elem_id: str, name: str, req: Request = INJECT) -> None:
+        return self.get_store(req).del_attr(elem_id, name)
+
+    @route("PUT", "/elements/{elem_id}/metrics/{name}", tags=["tags"])
     def add_metric(self, elem_id: str, name: str, metric_input: MetricInput, req: Request = INJECT) -> None:
-        self.get_store(req).add_metric(elem_id, name, metric_input)
+        return self.get_store(req).add_metric(elem_id, name, metric_input)
 
-    @route("DELETE", "/elements/{elem_id}/metrics/{name}", tags=["metrics"])
+    @route("DELETE", "/elements/{elem_id}/metrics/{name}", tags=["tags"])
     def del_metric(self, elem_id: str, name: str, req: Request = INJECT) -> None:
-        self.get_store(req).del_metric(elem_id, name)
+        return self.get_store(req).del_metric(elem_id, name)
 
     @route("PUT", "/elements/{elem_id}/values/{key}", tags=["values"])
     def insert_value(self, elem_id: str, key: str, value_input: ValueInput, req: Request = INJECT) -> Value:
@@ -476,6 +492,50 @@ class DocServer(DocStoreInterface):
         req: Request = INJECT,
     ):
         return self.get_store(req).update_task(task_id, grab_time, status, error_message)
+
+    #########################
+    # MANAGEMENT OPERATIONS #
+    #########################
+
+    @route("GET", "/users", tags=["users"])
+    def list_users(self, req: Request = INJECT) -> list[User]:
+        """List all users in the system."""
+        return self.get_store(req).list_users()
+
+    @route("POST", "/users", tags=["users"])
+    def insert_user(self, user_input: UserInput, req: Request = INJECT) -> User:
+        """Add a new user to the system."""
+        return self.get_store(req).insert_user(user_input)
+
+    @route("PUT", "/users/{name}", tags=["users"])
+    def update_user(self, name: str, user_update: UserUpdate, req: Request = INJECT) -> User:
+        """Update an existing user in the system."""
+        return self.get_store(req).update_user(name, user_update)
+
+    @route("GET", "/known-names", tags=["names"])
+    def list_known_names(self, req: Request = INJECT) -> list[KnownName]:
+        """List all known tag/attribute/metric names in the system."""
+        return self.get_store(req).list_known_names()
+
+    @route("POST", "/known-names", tags=["names"])
+    def insert_known_name(self, known_name_input: KnownNameInput, req: Request = INJECT) -> KnownName:
+        """Add a new known tag/attribute/metric name to the system."""
+        return self.get_store(req).insert_known_name(known_name_input)
+
+    @route("PUT", "/known-names/{name}", tags=["names"])
+    def update_known_name(self, name: str, known_name_update: KnownNameUpdate, req: Request = INJECT) -> KnownName:
+        """Update an existing known tag/attribute/metric name in the system."""
+        return self.get_store(req).update_known_name(name, known_name_update)
+
+    @route("PUT", "/known-names/{attr_name}/options/{option_name}", tags=["names"])
+    def add_known_option(self, attr_name: str, option_name: str, option_input: KnownOptionInput, req: Request = INJECT) -> None:
+        """Add/Update a new known option to a known attribute name."""
+        return self.get_store(req).add_known_option(attr_name, option_name, option_input)
+
+    @route("DELETE", "/known-names/{attr_name}/options/{option_name}", tags=["names"])
+    def del_known_option(self, attr_name: str, option_name: str, req: Request = INJECT) -> None:
+        """Delete a known option from a known attribute name."""
+        return self.get_store(req).del_known_option(attr_name, option_name)
 
 
 def main():

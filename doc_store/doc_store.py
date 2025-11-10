@@ -6,7 +6,7 @@ import re
 import time
 import uuid
 import warnings
-from functools import cached_property, wraps
+from functools import wraps
 from typing import Any, Callable, Iterable, Literal
 
 import numpy as np
@@ -18,6 +18,7 @@ from pymongo import ReturnDocument
 from pymongo.database import Database
 
 from .interface import (
+    AttrInput,
     Block,
     BlockInput,
     Content,
@@ -30,6 +31,10 @@ from .interface import (
     ElementExistsError,
     ElementNotFoundError,
     ElemType,
+    KnownName,
+    KnownNameInput,
+    KnownNameUpdate,
+    KnownOptionInput,
     Layout,
     LayoutInput,
     MetricInput,
@@ -40,6 +45,9 @@ from .interface import (
     Task,
     TaskInput,
     TaskMismatchError,
+    User,
+    UserInput,
+    UserUpdate,
     Value,
     ValueInput,
 )
@@ -47,8 +55,8 @@ from .io import read_file
 from .kafka import KafkaWriter
 from .mongodb import get_mongo_db
 from .pdf_doc import PDFDocument
-from .structs import ANGLE_OPTIONS, BLOCK_TYPES, CONTENT_FORMATS, ContentBlock
-from .utils import get_username
+from .structs import ANGLE_OPTIONS, BLOCK_TYPES, CONTENT_FORMATS
+from .utils import get_username, timed_property
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -62,6 +70,24 @@ def encode_ndarray(array: np.ndarray) -> str:
 def decode_ndarray(string: str) -> np.ndarray:
     with io.BytesIO(base64.b64decode(string)) as buffer:
         return np.load(buffer, allow_pickle=False)
+
+
+# Example of tags, attrs and metrics:
+# {
+#   "tags": [
+#     "prefix1__tag1",
+#     "prefix2__tag2",
+#   ],
+#   "attrs": {
+#     "attr_name_1": "attr_value_1",
+#     "attr_name_2": true,
+#     "attr_name_3": ["attr_value_3", "attr_value_4"],
+#   },
+#   "metrics": {
+#     "metric_name_1": 0.1,
+#     "metric_name_2": 2,
+#   },
+# }
 
 
 def _get_docs_coll(db: Database):
@@ -89,12 +115,10 @@ def _get_docs_coll(db: Database):
     #     "author": "xxxx"
     #   },
     #
-    #   "tags": ["tag1", "tag2"],
-    #
-    #   "metrics": {
-    #     "metric_name_1": 0.1,
-    #     "metric_name_2": 2,
-    #   },
+    #   /* Writable Fields */
+    #   "tags": [...],
+    #   "attrs": {...},
+    #   "metrics": {...},
     #
     #   "create_time": 1749031069945,
     #   "update_time": 1749031069945,
@@ -104,6 +128,7 @@ def _get_docs_coll(db: Database):
     coll_docs.create_index([("pdf_path", 1)], unique=True)
     coll_docs.create_index([("pdf_hash", 1)], unique=True)
     coll_docs.create_index([("tags", 1)])
+    coll_docs.create_index([("attrs.$**", 1)])
     coll_docs.create_index([("metrics.$**", 1)])
     return coll_docs
 
@@ -123,17 +148,11 @@ def _get_pages_coll(db: Database):
     #   "image_width": 0,
     #   "image_height": 0,
     #
-    #   "tags": ["tag1", "tag2"],
-    #
-    #   "metrics": {
-    #     "metric_name_1": 0.1,
-    #     "metric_name_2": 2,
-    #   },
-    #
     #   /* Writable Fields */
-    #   "labels": {
-    #     "label_name": "label_value",
-    #   },
+    #   "tags": [...],
+    #   "attrs": {...},
+    #   "metrics": {...},
+    #
     #   "create_time": 1749031069945,
     #   "update_time": 1749031069945,
     # }
@@ -143,11 +162,10 @@ def _get_pages_coll(db: Database):
     # coll_pages.create_index([("image_hash", 1)], unique=True)
     coll_pages.create_index([("doc_id", 1)])
     coll_pages.create_index([("tags", 1)])
+    coll_pages.create_index([("attrs.$**", 1)])
     coll_pages.create_index([("metrics.$**", 1)])
     # TODO: page should have initial category fields.
 
-    # page->layout->content,
-    # can i use page's label to filter layout and content?
     # how to represent golden state.
 
     return coll_pages
@@ -187,12 +205,11 @@ def _get_layouts_coll(db: Database):
     #     ...
     #   ],
     #
-    #   "tags": ["tag1", "tag2"],
+    #   /* Writable Fields */
+    #   "tags": [...],
+    #   "attrs": {...},
+    #   "metrics": {...},
     #
-    #   /* Statistics */
-    #   "stats": {
-    #
-    #   },
     #   "create_time": 1749031069945,
     #   "update_time": 1749031069945,
     # }
@@ -201,6 +218,7 @@ def _get_layouts_coll(db: Database):
     coll_layouts.create_index([("page_id", 1), ("provider", 1)], unique=True)
     coll_layouts.create_index([("provider", 1)])
     coll_layouts.create_index([("tags", 1)])
+    coll_layouts.create_index([("attrs.$**", 1)])
     coll_layouts.create_index([("metrics.$**", 1)])
     return coll_layouts
 
@@ -221,12 +239,11 @@ def _get_blocks_coll(db: Database):
     #     "provider_a": 1.0,
     #   },
     #
-    #   "tags": ["tag1", "tag2"],
-    #
     #   /* Writable Fields */
-    #   "labels": {
-    #     "label_name": "label_value",
-    #   },
+    #   "tags": [...],
+    #   "attrs": {...},
+    #   "metrics": {...},
+    #
     #   "create_time": 1749031069945,
     #   "update_time": 1749031069945,
     # }
@@ -235,6 +252,7 @@ def _get_blocks_coll(db: Database):
     # TODO: uncomment when index built.
     # coll_blocks.create_index([("page_id", 1), ("type", 1), ("bbox", 1), ("angle", 1)], unique=True)
     coll_blocks.create_index([("tags", 1)])
+    coll_blocks.create_index([("attrs.$**", 1)])
     coll_blocks.create_index([("metrics.$**", 1)])
     return coll_blocks
 
@@ -255,12 +273,11 @@ def _get_contents_coll(db: Database):
     #   "format": "markdown",
     #   "content": "content of the block",
     #
-    #   "tags": ["tag1", "tag2"],
-    #
     #   /* Writable Fields */
-    #   "labels": {
-    #     "label_name": "label_value",
-    #   },
+    #   "tags": [...],
+    #   "attrs": {...},
+    #   "metrics": {...},
+    #
     #   "create_time": 1749031069945,
     #   "update_time": 1749031069945,
     # }
@@ -270,6 +287,7 @@ def _get_contents_coll(db: Database):
     coll_contents.create_index([("version", 1)])
     coll_contents.create_index([("page_id", 1)])
     coll_contents.create_index([("tags", 1)])
+    coll_contents.create_index([("attrs.$**", 1)])
     coll_contents.create_index([("metrics.$**", 1)])
     return coll_contents
 
@@ -329,10 +347,10 @@ def _get_tasks_coll(db: Database):
     return coll_tasks
 
 
-def _get_known_users_coll(db: Database):
-    coll_known_users = db.get_collection("known_users")
-    coll_known_users.create_index([("name", 1)], unique=True)
-    return coll_known_users
+def _get_users_coll(db: Database):
+    coll_users = db.get_collection("known_users")
+    coll_users.create_index([("name", 1)], unique=True)
+    return coll_users
 
 
 def _get_known_names_coll(db: Database):
@@ -356,6 +374,17 @@ def _get_locks_coll(db: Database):
     coll_locks = db.get_collection("locks")
     coll_locks.create_index([("key", 1)], unique=True)
     return coll_locks
+
+
+def _get_counters_coll(db: Database):
+    # collection for distributed counters
+    # {
+    #   "key": "some-counter-key",
+    #   "value": 12345,
+    # }
+    coll_counters = db.get_collection("counters")
+    coll_counters.create_index([("key", 1)], unique=True)
+    return coll_counters
 
 
 class LockMismatchError(Exception):
@@ -395,6 +424,21 @@ class VersionalLocker:
         locked_version = self.read_ahead(key)
         func()
         self.post_commit(key, locked_version)
+
+
+class DistributedCounters:
+    def __init__(self, db: Database) -> None:
+        self.coll_counters = _get_counters_coll(db)
+
+    def next(self, key: str) -> int:
+        """Get the next value (start from 1) of the counter for the given key."""
+        result = self.coll_counters.find_one_and_update(
+            {"key": key},
+            {"$inc": {"value": 1}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return result["value"]
 
 
 _TMP_TYPE_MAPPING = {
@@ -587,10 +631,11 @@ class DocStore(DocStoreInterface):
         self.coll_contents = _get_contents_coll(db)
         self.coll_values = _get_values_coll(db)
         self.coll_tasks = _get_tasks_coll(db)
-        self.coll_known_users = _get_known_users_coll(db)
+        self.coll_users = _get_users_coll(db)
         self.coll_known_names = _get_known_names_coll(db)
         self.coll_task_shortcuts = _get_task_shortcuts_coll(db)
         self.locker = VersionalLocker(db)
+        self.counters = DistributedCounters(db)
         self.measure_time = measure_time
         self.times = {}
 
@@ -599,8 +644,8 @@ class DocStore(DocStoreInterface):
             self._event_sink = KafkaWriter()
 
         self.username = get_username()
-        self.writable = self.username in self.known_users
-        self.user_info = self.known_users.get(self.username) or {}
+        self.writable = self.username in self.all_users
+        self.user_info = self.all_users.get(self.username) or {}
         if not self.writable:
             warnings.warn(
                 f"User [{self.username}] is not a known writer, read-only mode enabled.",
@@ -618,16 +663,17 @@ class DocStore(DocStoreInterface):
         new_store.coll_contents = self.coll_contents
         new_store.coll_values = self.coll_values
         new_store.coll_tasks = self.coll_tasks
-        new_store.coll_known_users = self.coll_known_users
+        new_store.coll_users = self.coll_users
         new_store.coll_known_names = self.coll_known_names
         new_store.coll_task_shortcuts = self.coll_task_shortcuts
         new_store.locker = self.locker
+        new_store.counters = self.counters
         new_store.measure_time = self.measure_time
         new_store.times = {}
         new_store._event_sink = self._event_sink
         new_store.username = username
-        new_store.writable = username in new_store.known_users
-        new_store.user_info = new_store.known_users.get(username) or {}
+        new_store.writable = username in new_store.all_users
+        new_store.user_info = new_store.all_users.get(username) or {}
         return new_store
 
     def __enter__(self):
@@ -641,22 +687,41 @@ class DocStore(DocStoreInterface):
         if not self.writable:
             raise PermissionError(f"User [{self.username}] cannot write data to DocStore.")
 
-    def _check_name(self, name_type: str, name_value: str) -> None:
+    def _check_name(
+        self,
+        name_type: Literal["provider", "version", "key", "tag"],
+        name: str,
+    ) -> None:
         """Check if the provider or version is valid."""
-        if not isinstance(name_value, str):
-            raise ValueError(f"{name_type.capitalize()} must be a string.")
-        if not re.match(r"^[a-zA-Z0-9_]+$", name_value):
-            raise ValueError(f"{name_type.capitalize()} must contain only alphanumeric characters and underscores.")
-        if not self.user_info.get("restricted"):
-            if name_type == "tag" and name_value in self.known_tags:
+        if not isinstance(name, str):
+            raise ValueError(f"{name_type} must be a string.")
+        if not re.match(r"^[a-zA-Z0-9_]+$", name):
+            raise ValueError(f"{name_type} must contain only alphanumeric characters and underscores.")
+
+        if name_type == "tag":
+            name_info: KnownName | None = self.all_known_names[name_type].get(name)
+            if name_info is not None and name_info.disabled:
+                raise ValueError(f"Tag name [{name}] is disabled.")
+            if name_info is not None and not self.user_info.get("restricted"):
                 return  # Known tag, no need to check prefix
-            if name_type == "metric" and name_value in self.known_metrics:
-                return  # Known metric, no need to check prefix
+
         aliases = self.user_info.get("aliases") or []
         valid_prefixes = [f"{prefix}__" for prefix in [self.username, *aliases]]
-        if any(name_value.startswith(prefix) for prefix in valid_prefixes):
+        if any(name.startswith(prefix) for prefix in valid_prefixes):
             return  # Valid prefix
         raise ValueError(f"{name_type.capitalize()} must start with {valid_prefixes}.")
+
+    def _check_name_info(self, name_type: Literal["attr", "metric"], name: str) -> KnownName:
+        if not isinstance(name, str):
+            raise ValueError(f"{name_type.capitalize()} name must be a string.")
+        name_info: KnownName | None = self.all_known_names[name_type].get(name)
+        if name_info is None:
+            raise ValueError(f"Unknown {name_type} name [{name}].")
+        if name_info.disabled:
+            raise ValueError(f"{name_type.capitalize()} [{name}] is disabled.")
+        if self.user_info.get("restricted"):
+            raise ValueError(f"User [{self.username}] is restricted to write attrs/metrics.")
+        return name_info
 
     def _new_id(self, elem_type: type[T]) -> str:
         """Generate a new unique ID for an element."""
@@ -790,6 +855,8 @@ class DocStore(DocStoreInterface):
             elem_data["rid"] = int(elem_id[-8:], 16) & 0x7FFFFFFF
         if elem_data.get("tags") is None:
             elem_data["tags"] = []
+        if elem_data.get("attrs") is None:
+            elem_data["attrs"] = {}
         if elem_data.get("metrics") is None:
             elem_data["metrics"] = {}
 
@@ -1048,37 +1115,72 @@ class DocStore(DocStoreInterface):
 
         return result_blocks
 
-    ##############
-    # PROPERTIES #
-    ##############
+    #########################
+    # MANAGEMENT OPERATIONS #
+    #########################
 
-    @cached_property
-    def known_users(self) -> dict[str, dict]:
-        users = {}
-        for user in self.coll_known_users.find({}):
-            user.pop("_id", None)
-            name = user.pop("name", None)
-            if name:
-                users[name] = user
+    @timed_property(ttl=10)
+    def all_users(self) -> dict[str, User]:
+        return {user.name: user for user in self.list_users()}
+
+    @timed_property(ttl=10)
+    def all_known_names(self) -> dict[Literal["tag", "attr", "metric"], dict[str, KnownName]]:
+        all_names: dict[Literal["tag", "attr", "metric"], dict[str, KnownName]] = {}
+        all_names["tag"], all_names["attr"], all_names["metric"] = {}, {}, {}
+        for known_name in self.list_known_names():
+            all_names[known_name.type][known_name.name] = known_name
+        return all_names
+
+    def list_users(self) -> list[User]:
+        """List all users in the system."""
+        users: list[User] = []
+        for user_data in self.coll_users.find({}):
+            user_data.pop("_id", None)
+            try:
+                users.append(User(**user_data))
+            except Exception as e:
+                warnings.warn(f"Failed to parse user data {user_data}: {e}")
         return users
 
-    @cached_property
-    def known_tags(self) -> set[str]:
-        tags = set()
-        for item in self.coll_known_names.find({"type": "tag"}):
-            if item.get("name"):
-                tags.add(item["name"])
-        return tags
+    def insert_user(self, user_input: UserInput) -> User:
+        """Add a new user to the system."""
+        raise NotImplementedError()
 
-    @cached_property
-    def known_metrics(self) -> set[str]:
-        metrics = set()
-        for item in self.coll_known_names.find({"type": "metric"}):
-            if item.get("name"):
-                metrics.add(item["name"])
-        return metrics
+    def update_user(self, name: str, user_update: UserUpdate) -> User:
+        """Update an existing user in the system."""
+        raise NotImplementedError()
 
-    @cached_property
+    def list_known_names(self) -> list[KnownName]:
+        """List all known tag/attribute/metric names in the system."""
+        known_names: list[KnownName] = []
+        for data in self.coll_known_names.find({}):
+            data.pop("_id", None)
+            try:
+                known_names.append(KnownName(**data))
+            except Exception as e:
+                warnings.warn(f"Failed to parse known name data {data}: {e}")
+        return known_names
+
+    def insert_known_name(self, known_name_input: KnownNameInput) -> KnownName:
+        """Add a new known tag/attribute/metric name to the system."""
+
+        if not re.match(r"^[a-zA-Z0-9_]+$", name_value):
+            raise ValueError(f"{name_type} must contain only alphanumeric characters and underscores.")
+        raise NotImplementedError()
+
+    def update_known_name(self, name: str, known_name_update: KnownNameUpdate) -> KnownName:
+        """Update an existing known tag/attribute/metric name in the system."""
+        raise NotImplementedError()
+
+    def add_known_option(self, attr_name: str, option_name: str, option_input: KnownOptionInput) -> None:
+        """Add/Update a new known option to a known attribute name."""
+        raise NotImplementedError()
+
+    def del_known_option(self, attr_name: str, option_name: str) -> None:
+        """Delete a known option from a known attribute name."""
+        raise NotImplementedError()
+
+    @timed_property(ttl=10)
     def task_shortcuts(self) -> dict[str, dict]:
         shortcuts = {}
         for shortcut in self.coll_task_shortcuts.find({}):
@@ -1334,15 +1436,64 @@ class DocStore(DocStoreInterface):
             self._event_sink.write(event_data)
 
     @_measure_time
+    def add_attr(self, elem_id: str, name: str, attr_input: AttrInput) -> None:
+        """Add an attribute to an element."""
+        self._check_writable()
+        if not isinstance(attr_input, AttrInput):
+            raise ValueError("attr_input must be a AttrInput instance.")
+        value = attr_input.value
+
+        name_info = self._check_name_info("attr", name)
+        if name_info.value_type == "str":
+            if not isinstance(value, str):
+                raise ValueError(f"Attr {name} requires str value.")
+        elif name_info.value_type == "bool":
+            if not isinstance(value, bool):
+                raise ValueError(f"Attr {name} requires bool value.")
+        elif name_info.value_type == "list_str":
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise ValueError(f"Attr {name} requires list of str value.")
+
+        elem_type = self._get_elem_type_by_id(elem_id)
+        coll = self._get_coll(elem_type)
+        now = int(time.time() * 1000)
+
+        if not coll.update_one(
+            {"id": elem_id, "attrs": None},
+            {"$set": {"attrs": {name: value}, "update_time": now}},
+        ).modified_count:
+            coll.update_one(
+                {"id": elem_id},
+                {"$set": {f"attrs.{name}": value, "update_time": now}},
+            )
+
+    @_measure_time
+    def del_attr(self, elem_id: str, name: str) -> None:
+        """Delete an attribute from an element."""
+        self._check_writable()
+        self._check_name_info("attr", name)
+        elem_type = self._get_elem_type_by_id(elem_id)
+        coll = self._get_coll(elem_type)
+        now = int(time.time() * 1000)
+        coll.update_one(
+            {"id": elem_id},
+            {
+                "$unset": {f"attrs.{name}": ""},
+                "$set": {"update_time": now},
+            },
+        )
+
+    @_measure_time
     def add_metric(self, elem_id: str, name: str, metric_input: MetricInput) -> None:
         """Add a metric to an element."""
         self._check_writable()
-        self._check_name("metric", name)
-
         if not isinstance(metric_input, MetricInput):
             raise ValueError("metric_input must be a MetricInput instance.")
-
         value = metric_input.value
+
+        name_info = self._check_name_info("metric", name)
+        if name_info.value_type == "int" and not isinstance(value, int):
+            raise ValueError(f"Metric {name} requires int value.")
 
         elem_type = self._get_elem_type_by_id(elem_id)
         coll = self._get_coll(elem_type)
@@ -1361,7 +1512,7 @@ class DocStore(DocStoreInterface):
     def del_metric(self, elem_id: str, name: str) -> None:
         """Delete a metric from an element."""
         self._check_writable()
-        self._check_name("metric", name)
+        self._check_name_info("metric", name)
         elem_type = self._get_elem_type_by_id(elem_id)
         coll = self._get_coll(elem_type)
         now = int(time.time() * 1000)

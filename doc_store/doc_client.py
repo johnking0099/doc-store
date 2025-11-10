@@ -5,6 +5,7 @@ import httpx
 
 from .config import config
 from .interface import (
+    AttrInput,
     Block,
     BlockInput,
     Content,
@@ -18,6 +19,10 @@ from .interface import (
     ElementNotFoundError,
     ElemType,
     InputModel,
+    KnownName,
+    KnownNameInput,
+    KnownNameUpdate,
+    KnownOptionInput,
     Layout,
     LayoutInput,
     MetricInput,
@@ -26,6 +31,9 @@ from .interface import (
     T,
     Task,
     TaskInput,
+    User,
+    UserInput,
+    UserUpdate,
     Value,
     ValueInput,
 )
@@ -335,6 +343,15 @@ class DocClient(DocStoreInterface):
         """Delete tag from an element."""
         self._delete(f"/elements/{elem_id}/tags/{tag}")
 
+    def add_attr(self, elem_id: str, name: str, attr_input: AttrInput) -> None:
+        """Add an attribute to an element."""
+        input_data = self._dump_elem(attr_input)
+        self._put(f"/elements/{elem_id}/attrs/{name}", json_data=input_data)
+
+    def del_attr(self, elem_id: str, name: str) -> None:
+        """Delete an attribute from an element."""
+        self._delete(f"/elements/{elem_id}/attrs/{name}")
+
     def add_metric(self, elem_id: str, name: str, metric_input: MetricInput) -> None:
         """Add a metric to an element."""
         input_data = self._dump_elem(metric_input)
@@ -460,3 +477,56 @@ class DocClient(DocStoreInterface):
         if error_message:
             params["error_message"] = error_message
         return self._post(f"/update-grabbed-task/{task_id}", params=params)
+
+    #########################
+    # MANAGEMENT OPERATIONS #
+    #########################
+
+    def list_users(self) -> list[User]:
+        """List all users in the system."""
+        data = self._get("/users")
+        assert isinstance(data, list)
+        return [User(**user_data) for user_data in data]
+
+    def insert_user(self, user_input: UserInput) -> User:
+        """Add a new user to the system."""
+        input_data = user_input.model_dump()
+        data = self._post("/users", json_data=input_data)
+        assert isinstance(data, dict)
+        return User(**data)
+
+    def update_user(self, name: str, user_update: UserUpdate) -> User:
+        """Update an existing user in the system."""
+        input_data = user_update.model_dump()
+        data = self._put(f"/users/{name}", json_data=input_data)
+        assert isinstance(data, dict)
+        return User(**data)
+
+    def list_known_names(self) -> list[KnownName]:
+        """List all known tag/attribute/metric names in the system."""
+        data = self._get("/known-names")
+        assert isinstance(data, list)
+        return [KnownName(**name_data) for name_data in data]
+
+    def insert_known_name(self, known_name_input: KnownNameInput) -> KnownName:
+        """Add a new known tag/attribute/metric name to the system."""
+        input_data = known_name_input.model_dump()
+        data = self._post("/known-names", json_data=input_data)
+        assert isinstance(data, dict)
+        return KnownName(**data)
+
+    def update_known_name(self, name: str, known_name_update: KnownNameUpdate) -> KnownName:
+        """Update an existing known tag/attribute/metric name in the system."""
+        input_data = known_name_update.model_dump()
+        data = self._put(f"/known-names/{name}", json_data=input_data)
+        assert isinstance(data, dict)
+        return KnownName(**data)
+
+    def add_known_option(self, attr_name: str, option_name: str, option_input: KnownOptionInput) -> None:
+        """Add/Update a new known option to a known attribute name."""
+        input_data = option_input.model_dump()
+        self._put(f"/known-names/{attr_name}/options/{option_name}", json_data=input_data)
+
+    def del_known_option(self, attr_name: str, option_name: str) -> None:
+        """Delete a known option from a known attribute name."""
+        self._delete(f"/known-names/{attr_name}/options/{option_name}")

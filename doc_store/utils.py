@@ -1,7 +1,9 @@
 import getpass
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 
 
 class BlockingThreadPool(ThreadPoolExecutor):
@@ -47,3 +49,29 @@ def secs_to_readable(secs: int) -> str:
     minutes, secs = secs // 60, secs % 60
     # return in 01:11:30 format
     return f"{hours:02}:{minutes:02}:{secs:02}"
+
+
+def timed_property(ttl: int):
+    """A decorator to create a cached property with a TTL."""
+
+    def decorator(func):
+        cache = {}
+
+        @wraps(func)
+        def wrapper(self):
+            key = id(self)
+            now = time.time()
+
+            if key in cache:
+                value, expire_time = cache[key]
+                if ttl <= 0 or now < expire_time:
+                    return value
+
+            value = func(self)
+            expire_time = float("inf") if ttl <= 0 else now + ttl
+            cache[key] = (value, expire_time)
+            return value
+
+        return property(wrapper)
+
+    return decorator
