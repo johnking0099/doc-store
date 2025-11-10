@@ -626,6 +626,7 @@ class User(DictModel):
     name: str
     aliases: list[str] = []
     restricted: bool = False
+    is_admin: bool = False
 
 
 class UserInput(InputModel):
@@ -637,6 +638,7 @@ class UserInput(InputModel):
 class UserUpdate(InputModel):
     aliases: list[str] | None = None
     restricted: bool | None = None
+    is_admin: bool | None  = None
 
 
 class KnownOption(DictModel):

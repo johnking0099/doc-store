@@ -621,6 +621,16 @@ class TaskEntity(Entity):
     error_message: str | None
 
 
+class KnownNameEntity(Entity):
+    name: str
+    display_name: str
+    description: str
+    type: Literal["tag", "attr", "metric"]
+    value_type: Literal["null", "int", "float", "str", "list_str", "bool"]
+    options: dict[str, dict]
+    disabled: bool
+
+
 class DocStore(DocStoreInterface):
     def __init__(self, measure_time=False, disable_events=False):
         db = get_mongo_db()
@@ -682,10 +692,12 @@ class DocStore(DocStoreInterface):
     def __exit__(self, type, value, tb):
         self.flush()
 
-    def _check_writable(self) -> None:
+    def _check_writable(self, check_admin: bool = False) -> None:
         """Check if the current user can write data to the DocStore."""
         if not self.writable:
             raise PermissionError(f"User [{self.username}] cannot write data to DocStore.")
+        if check_admin and not self.user_info.get("is_admin"):
+            raise PermissionError(f"User [{self.username}] is not an admin user.")
 
     def _check_name(
         self,
@@ -874,6 +886,14 @@ class DocStore(DocStoreInterface):
         elem_object = elem_type(**elem_data)
         elem_object.store = self
         return elem_object
+
+    def _parse_known_name(self, name_data: dict) -> KnownName:
+        """Parse known name data after retrieval."""
+        options_dict = name_data.get("options") or {}
+        options_list = [{"name": k, **v} for k, v in options_dict.items()]
+        name_data = {k: v for k, v in name_data.items() if k not in ("_id", "options")}
+        name_data["options"] = options_list
+        return KnownName(**name_data)
 
     @_measure_time
     def _try_get_elem(self, elem_type: type[T], query: dict) -> T | None:
@@ -1144,41 +1164,137 @@ class DocStore(DocStoreInterface):
 
     def insert_user(self, user_input: UserInput) -> User:
         """Add a new user to the system."""
+        self._check_writable(check_admin=True)
+        if not isinstance(user_input, UserInput):
+            raise ValueError("user_input must be an instance of UserInput.")
         raise NotImplementedError()
 
     def update_user(self, name: str, user_update: UserUpdate) -> User:
         """Update an existing user in the system."""
+        self._check_writable(check_admin=True)
+        if not isinstance(name, str) or not name:
+            raise ValueError("name must be a non-empty string.")
+        if not isinstance(user_update, UserUpdate):
+            raise ValueError("user_update must be an instance of UserUpdate.")
         raise NotImplementedError()
 
     def list_known_names(self) -> list[KnownName]:
         """List all known tag/attribute/metric names in the system."""
         known_names: list[KnownName] = []
         for data in self.coll_known_names.find({}):
-            data.pop("_id", None)
-            try:
-                known_names.append(KnownName(**data))
-            except Exception as e:
-                warnings.warn(f"Failed to parse known name data {data}: {e}")
+            known_names.append(self._parse_known_name(data))
         return known_names
 
     def insert_known_name(self, known_name_input: KnownNameInput) -> KnownName:
         """Add a new known tag/attribute/metric name to the system."""
+        self._check_writable(check_admin=True)
+        if not isinstance(known_name_input, KnownNameInput):
+            raise ValueError("known_name_input must be an instance of KnownNameInput.")
+        if not re.match(r"^[a-zA-Z0-9_]+$", known_name_input.name):
+            raise ValueError(f"Name must contain only alphanumeric characters and underscores.")
+        if known_name_input.type == "tag":
+            if known_name_input.value_type != "null":
+                raise ValueError(f"Tag type must have value_type 'null'.")
+        elif known_name_input.type == "attr":
+            if known_name_input.value_type not in ("str", "list_str", "bool"):
+                raise ValueError(f"Attr type must have value_type 'str', 'list_str', or 'bool'.")
+        elif known_name_input.type == "metric":
+            if known_name_input.value_type not in ("int", "float"):
+                raise ValueError(f"Metric type must have value_type 'int' or 'float'.")
+        else:  # should not happen
+            raise ValueError(f"Type must be one of 'tag', 'attr', or 'metric'.")
+        if self.coll_known_names.find_one({"name": known_name_input.name}):
+            raise ValueError(f"Name [{known_name_input.name}] already exists.")
 
-        if not re.match(r"^[a-zA-Z0-9_]+$", name_value):
-            raise ValueError(f"{name_type} must contain only alphanumeric characters and underscores.")
-        raise NotImplementedError()
+        name_entity = KnownNameEntity(
+            name=known_name_input.name,
+            display_name=known_name_input.display_name,
+            description=known_name_input.description,
+            type=known_name_input.type,
+            value_type=known_name_input.value_type,
+            options={},
+            disabled=False,
+        )
+
+        try:
+            name_data = name_entity.model_dump()
+            self.coll_known_names.insert_one(name_data)
+        except pymongo.errors.DuplicateKeyError:
+            raise ValueError(f"Name [{known_name_input.name}] already exists.")
+
+        return self._parse_known_name(name_data)
 
     def update_known_name(self, name: str, known_name_update: KnownNameUpdate) -> KnownName:
         """Update an existing known tag/attribute/metric name in the system."""
-        raise NotImplementedError()
+        self._check_writable(check_admin=True)
+        if not isinstance(name, str) or not name:
+            raise ValueError("name must be a non-empty string.")
+        if not isinstance(known_name_update, KnownNameUpdate):
+            raise ValueError("known_name_update must be an instance of KnownNameUpdate.")
+
+        name_update = {}
+        if known_name_update.display_name is not None:
+            name_update["display_name"] = known_name_update.display_name
+        if known_name_update.description is not None:
+            name_update["description"] = known_name_update.description
+        if known_name_update.disabled is not None:
+            name_update["disabled"] = known_name_update.disabled
+
+        if name_update:
+            name_data = self.coll_known_names.find_one_and_update(
+                {"name": name},
+                {"$set": name_update},
+                upsert=False,
+                return_document=ReturnDocument.AFTER,
+            )
+        else:  # nothing to update
+            name_data = self.coll_known_names.find_one({"name": name})
+
+        if name_data is None:
+            raise ValueError(f"Known name [{name}] does not exist.")
+
+        return self._parse_known_name(name_data)
 
     def add_known_option(self, attr_name: str, option_name: str, option_input: KnownOptionInput) -> None:
         """Add/Update a new known option to a known attribute name."""
-        raise NotImplementedError()
+        self._check_writable(check_admin=True)
+        if not isinstance(attr_name, str) or not attr_name:
+            raise ValueError("attr_name must be a non-empty string.")
+        if not isinstance(option_name, str) or not option_name:
+            raise ValueError("option_name must be a non-empty string.")
+        if not isinstance(option_input, KnownOptionInput):
+            raise ValueError("option_input must be an instance of KnownOptionInput.")
+        if not re.match(r"^[a-zA-Z0-9_]+$", option_name):
+            raise ValueError(f"Option name must contain only alphanumeric characters and underscores.")
+        name_data = self.coll_known_names.find_one({"name": attr_name})
+        if name_data is None:
+            raise ValueError(f"Attr name [{attr_name}] does not exist.")
+
+        option_data = {
+            "display_name": option_input.display_name,
+            "description": option_input.description,
+        }
+
+        if not self.coll_known_names.update_one(
+            {"name": attr_name, "options": None},
+            {"$set": {"options": {option_name: option_data}}},
+        ).modified_count:
+            self.coll_known_names.update_one(
+                {"name": attr_name},
+                {"$set": {f"options.{option_name}": option_data}},
+            )
 
     def del_known_option(self, attr_name: str, option_name: str) -> None:
         """Delete a known option from a known attribute name."""
-        raise NotImplementedError()
+        self._check_writable(check_admin=True)
+        if not isinstance(attr_name, str) or not attr_name:
+            raise ValueError("attr_name must be a non-empty string.")
+        if not isinstance(option_name, str) or not option_name:
+            raise ValueError("option_name must be a non-empty string.")
+        self.coll_known_names.update_one(
+            {"name": attr_name},
+            {"$unset": {f"options.{option_name}": ""}},
+        )
 
     @timed_property(ttl=10)
     def task_shortcuts(self) -> dict[str, dict]:
