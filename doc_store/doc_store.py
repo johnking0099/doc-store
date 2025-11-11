@@ -1570,6 +1570,8 @@ class DocStore(DocStoreInterface):
             if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
                 raise ValueError(f"Attr {name} requires list of str value.")
 
+        # TODO: check value is defined.
+
         elem_type = self._get_elem_type_by_id(elem_id)
         coll = self._get_coll(elem_type)
         now = int(time.time() * 1000)
